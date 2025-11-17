@@ -1,227 +1,170 @@
-# --- Configuration Variables (REPLACE THESE) ---
-# NOTE: Using backticks (`) for line continuation to keep config clean
-$URL = "XXX.app.liongard.com"
-$Key = "PasteKeyHere"
-$Secret = "PasteSecretHere"
-$EnvironmentName = "PasteEnvironmentName/RMM Variable"
+<#
+.SYNOPSIS
+    Liongard Agent Installation - Production Ready (v2.3)
+.DESCRIPTION
+    - Enforced Inputs: Friendly loop for humans, graceful exit for RMMs.
+    - Race Condition Fix: Waits for MSI logs to flush.
+    - Deep Error Analysis: Explains failures (401, Invalid URL, etc).
+#>
+param(
+    [string]$Url,
+    [string]$AccessKey,
+    [string]$AccessSecret,
+    [string]$Environment
+)
 
-# --- Script Configuration ---
-$Folder = 'C:\Liongard'
-$LogFile = "$Folder\ScriptInstall.log"
-$MsiPath = "$Folder\LiongardAgent-lts.msi"
-$DownloadUri = "https://agents.static.liongard.com/LiongardAgent-lts.msi"
-$MinMsiSize = 10485760    # 10 MB in bytes (minimum expected size)
-$MinFreeSpaceMB = 200     # Minimum required free disk space (MB)
-$AgentService = "LiongardAgent" # Name of the installed service
+# --- 0. Setup & Logging ---
+$Folder          = "$env:ProgramData\Liongard"
+$LogFile         = "$Folder\ScriptInstall.log"
+$TranscriptPath  = "$Folder\TranscriptLog.txt"
 
-# --- Proxy Configuration (Optional) ---
-# Uncomment and configure if a Web Proxy is required for internet access
-# If using a proxy, you may need to run PowerShell as the user with access to the proxy.
-# $ProxyUrl = "http://proxy.corp.com:8080"
-# $ProxyCredential = Get-Credential # Prompts user for credentials if needed
+if (-not (Test-Path -Path $Folder)) { New-Item -Path $Folder -ItemType Directory -ErrorAction SilentlyContinue | Out-Null }
 
-# Function for both console and file logging
+try { Start-Transcript -Path $TranscriptPath -Append -Force -ErrorAction Stop } 
+catch { Write-Host "WARNING: Transcript failed. Proceeding without it." -ForegroundColor Yellow }
+
 function Write-Log {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$Message
-    )
+    param( [string]$Message, [string]$Type="INFO" )
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $LogEntry = "[$Timestamp] $Message"
+    $LogEntry = "[$Timestamp] [$Type] $Message"
     Write-Host $LogEntry
-    # Add-Content needs to use -Encoding to avoid BOM issues with some RMM tools
     Add-Content -Path $LogFile -Value $LogEntry -Encoding Default -ErrorAction SilentlyContinue
 }
 
-# --- Initialization and Setup ---
-Write-Log "--- Starting Liongard Agent Installation Script ---"
-try {
-    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-    Write-Log "Set Security Protocol to TLS 1.2 successfully."
-}
-catch {
-    $ErrorMessage = "ERROR: Failed to set TLS 1.2 protocol. This may cause download failure. $_"
-    Write-Log $ErrorMessage
-    Write-Error $ErrorMessage
-}
-
-# --- Check for Existing Agent ---
-Write-Log "Checking for previous installs of Liongard Agent..."
-$ProductNames = @('Liongard Agent', 'RoarAgent')
-$ExistingAgent = $ProductNames | ForEach-Object {
-    Get-WmiObject -Class Win32_Product -Filter "Name = '$_'" -ErrorAction SilentlyContinue
-}
-
-if ($ExistingAgent) {
-    Write-Log "A previous install of the Liongard Agent was found! Installation stopped."
-    Exit 0
-}
-else {
-    Write-Log "No Liongard Agent install was found. Proceeding with installation."
-}
-
-# --- Folder Check, Creation, and Writable Test ---
-Write-Log "Checking if folder [$Folder] exists..."
-if (-not (Test-Path -Path $Folder)) {
-    try {
-        Write-Log "Path doesn't exist. Attempting to create Liongard folder in C:..."
-        New-Item -Path $Folder -ItemType Directory | Out-Null
-        Write-Log "[$Folder] was created successfully."
+function Exit-Smart {
+    param ([int]$Code)
+    Stop-Transcript -ErrorAction SilentlyContinue
+    if ([Environment]::UserInteractive) {
+        Write-Host "`n---------------------------------------------------"
+        if ($Code -ne 0) { Write-Host "SCRIPT FAILED (Exit Code $Code) - Check logs above." -ForegroundColor Red }
+        else { Write-Host "SCRIPT FINISHED SUCCESSFULLY" -ForegroundColor Green }
+        Write-Host "---------------------------------------------------"
+        Read-Host "Press Enter to close this window..."
     }
-    catch {
-        $ErrorMessage = "ERROR: Failed to create folder [$Folder]. Check script permissions. $_"
-        Write-Log $ErrorMessage
-        Write-Error $ErrorMessage
-        Write-Log "Terminating Script."
-        Exit 1
-    }
-}
-else {
-    Write-Log "Path [$Folder] exists."
+    Exit $Code
 }
 
-# Added: Destination Path Writable Check
-$TestFile = "$Folder\write_test.tmp"
-try {
-    "Test" | Out-File $TestFile -Encoding ASCII -Force
-    Remove-Item $TestFile -Force
-    Write-Log "Successfully verified write access to $Folder."
-}
-catch {
-    $ErrorMessage = "ERROR: Write access test failed on $Folder. Check script and user permissions. $_"
-    Write-Log $ErrorMessage
-    Write-Error $ErrorMessage
-    Write-Log "Terminating Script."
-    Exit 1
-}
+# --- 1. The "Friendly Enforcer" Input Function ---
+function Get-RequiredInput {
+    param ( [string]$CurrentValue, [string]$PromptName )
 
-# --- ADDED: Disk Space Check ---
-Write-Log "Checking for minimum $MinFreeSpaceMB MB of free space on C: drive..."
-try {
-    $Disk = Get-WmiObject -Class Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction Stop
-    $FreeSpaceMB = [System.Math]::Round($Disk.FreeSpace / 1MB, 0)
-    
-    if ($FreeSpaceMB -lt $MinFreeSpaceMB) {
-        $ErrorMessage = "ERROR: Insufficient free disk space. Required $MinFreeSpaceMB MB, available $FreeSpaceMB MB."
-        Write-Log $ErrorMessage
-        Write-Error $ErrorMessage
-        Write-Log "Terminating Script."
-        Exit 1
-    }
-    Write-Log "Disk space check passed. Available free space: $FreeSpaceMB MB."
-}
-catch {
-    $ErrorMessage = "WARNING: Failed to retrieve disk space information. Proceeding with warning. $_"
-    Write-Log $ErrorMessage
-}
+    # 1. If passed via RMM/Param, use it.
+    if (-not [string]::IsNullOrWhiteSpace($CurrentValue)) { return $CurrentValue }
 
-# --- Basic Connectivity Test ---
-Write-Log "Testing basic internet connectivity (Google DNS 8.8.8.8)..."
-if (-not (Test-Connection -ComputerName 8.8.8.8 -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
-    $ErrorMessage = "ERROR: Basic connectivity test failed. Check network cables/settings."
-    Write-Log $ErrorMessage
-    Write-Error $ErrorMessage
-    Write-Log "Terminating Script."
-    Exit 1
-}
-Write-Log "Basic connectivity check passed."
+    # 2. If RMM (Headless), we can't ask. Return null to trigger graceful failure.
+    if (-not [Environment]::UserInteractive) { return $null }
 
-# --- MSI Installer Download with Robust Error Handling ---
-Write-Log "Attempting to download installer from [$DownloadUri]..."
-try {
-    # Build IWR parameters, including proxy if configured
-    $IWRParams = @{
-        Uri          = $DownloadUri
-        OutFile      = $MsiPath
-        ErrorAction  = 'Stop'
-        UseBasicParsing = $true # Use this for compatibility
-    }
-    
-    # Check for optional Proxy configuration
-    if ($PSBoundParameters.ContainsKey('ProxyUrl')) {
-        $IWRParams.Proxy = $ProxyUrl
-        Write-Log "Using explicit proxy: $ProxyUrl"
-        if ($PSBoundParameters.ContainsKey('ProxyCredential')) {
-            $IWRParams.ProxyCredential = $ProxyCredential
-            Write-Log "Using explicit proxy credentials."
+    # 3. Interactive Loop (The Friendly Reminder)
+    $Val = $null
+    do {
+        $Val = Read-Host "`n$PromptName (Required)"
+        if ([string]::IsNullOrWhiteSpace($Val)) {
+            Write-Host "   [!] We can't proceed without the $PromptName." -ForegroundColor Yellow
+            Write-Host "       Please enter it to continue." -ForegroundColor Gray
         }
-    }
-
-    # Execute download
-    Invoke-WebRequest @IWRParams
+    } until (-not [string]::IsNullOrWhiteSpace($Val))
     
-    # Post-Download File Existence & Size Verification
-    if (-not (Test-Path $MsiPath)) {
-        throw "Download command succeeded but file $MsiPath was not found."
-    }
-    
-    $MsiInfo = Get-Item $MsiPath
-    if ($MsiInfo.Length -lt $MinMsiSize) {
-        $ErrorSize = "$($MsiInfo.Length) bytes"
-        throw "Downloaded file size ($ErrorSize) is too small (expected > $MinMsiSize bytes). The download likely failed or was corrupted."
-    }
-    
-    Write-Log "Liongard Agent installer downloaded successfully and passed size verification."
-}
-catch {
-    $ErrorMessage = "FATAL ERROR: Installer download failed. Common issues: Network, Firewall, Proxy, or DNS. Specific Error: $($_.Exception.Message)"
-    Write-Log $ErrorMessage
-    Write-Error $ErrorMessage
-    
-    Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
-    Write-Log "Terminating Script due to download failure."
-    Exit 1
+    return $Val
 }
 
-# --- Installation ---
-Write-Log "Installing the Liongard Agent..."
-# Arguments need to be safe for RMM systems/executables
-$InstallArgs = "/i `"$MsiPath`" LIONGARDURL=$URL LIONGARDACCESSKEY=$Key LIONGARDACCESSSECRET=$Secret LIONGARDENVIRONMENT=`"$EnvironmentName`" LIONGARDAGENTNAME=`"$env:computername`" /qn /norestart /L*V `"$Folder\AgentInstall.log`""
+Write-Log "--- Starting Liongard Agent Installation (v2.3) ---"
+
+# --- 2. Get Inputs (with Enforcement) ---
+$Url          = Get-RequiredInput -CurrentValue $Url          -PromptName "1. Liongard URL"
+$AccessKey    = Get-RequiredInput -CurrentValue $AccessKey    -PromptName "2. Access Key ID"
+$AccessSecret = Get-RequiredInput -CurrentValue $AccessSecret -PromptName "3. Access Key Secret"
+
+# Environment is optional, so we use standard Read-Host logic (no enforcement loop)
+if ([string]::IsNullOrWhiteSpace($Environment) -and [Environment]::UserInteractive) {
+    $Environment = Read-Host "`n4. Environment Name (Optional - Press Enter to skip)"
+}
+
+# --- 3. RMM Graceful Handling (Validation) ---
+if (-not $Url -or -not $AccessKey -or -not $AccessSecret) {
+    Write-Log "FATAL ERROR: Missing required variables." "ERROR"
+    Write-Log "If running via RMM, you MUST pass these as script arguments." "ERROR"
+    Exit-Smart 1
+}
+
+# --- 4. Sanitization ---
+if ($Url -match "https://") { $Url = $Url -replace "https://","" -replace "/","" }
+if ($Url -notmatch "\.app\.liongard\.com") {
+    $Url = "$Url.app.liongard.com"
+    Write-Log "Auto-corrected URL to: $Url"
+}
+
+$MsiPath         = "$env:TEMP\LiongardAgent-lts.msi" 
+$DownloadUri     = "https://agents.static.liongard.com/LiongardAgent-lts.msi"
+$MinMsiSize      = 10485760 
+$MinFreeSpaceMB  = 200
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+# --- 5. Pre-Flight Checks ---
+Write-Log "Checking for existing Liongard Agent Service..."
+if (Get-Service | Where-Object { $_.Name -like "*Liongard*" -or $_.DisplayName -like "*Liongard*" }) {
+    Write-Log "A Liongard Agent service is already present. Aborting." "WARN"
+    Exit-Smart 0
+}
 
 try {
-    Write-Log "Executing msiexec..."
-    # Use Start-Process with -Wait for synchronous, reliable execution
-    Start-Process -FilePath "msiexec.exe" -ArgumentList $InstallArgs -Wait -NoNewWindow
+    $Disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" | Select-Object FreeSpace
+    if (([math]::Round($Disk.FreeSpace / 1MB)) -lt $MinFreeSpaceMB) { throw "Insufficient disk space." }
     
-    Write-Log "msiexec process finished. Checking installation status..."
-    
-    # Post-Installation Log Verification (MSI Success Code)
-    $MsiLog = "$Folder\AgentInstall.log"
-    Start-Sleep -Seconds 5 # Give log a moment to write
-    
-    if (-not (Test-Path $MsiLog)) {
-        Write-Log "WARNING: Installation log file not found at $MsiLog. Cannot confirm MSI success via log."
-    }
-    elseif ((Get-Content $MsiLog | Select-String -Pattern "Product: Liongard Agent -- Installation operation successfully completed\.")) {
-        Write-Log "Installation log shows SUCCESS."
-    }
-    else {
-        $ErrorMessage = "ERROR: Installation log exists but does NOT show successful completion message. Check $MsiLog for MSI error codes."
-        Write-Log $ErrorMessage
-        Write-Error $ErrorMessage
-        Write-Log "Terminating Script due to installation error."
-        Exit 1
-    }
+    Write-Log "Verifying connectivity..."
+    $Request = [System.Net.WebRequest]::Create($DownloadUri); $Request.Method = "HEAD"; $Response = $Request.GetResponse(); $Response.Close()
+}
+catch { Write-Log "Pre-check failed: $_" "ERROR"; Exit-Smart 1 }
 
-    # Service Status Verification
-    Start-Sleep -Seconds 10 # Give service time to initialize
-    $Service = Get-Service -Name $AgentService -ErrorAction SilentlyContinue
-    if ($Service -and $Service.Status -eq "Running") {
-        Write-Log "Verification SUCCESS: Liongard Agent service is running."
-    }
-    else {
-        $ErrorMessage = "WARNING: Liongard Agent service ($AgentService) not found or not running after installation. Check installation log."
-        Write-Log $ErrorMessage
-        Write-Error $ErrorMessage
+# --- 6. Download & Install ---
+Write-Log "Downloading MSI..."
+try {
+    Invoke-WebRequest -Uri $DownloadUri -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop
+    if ((Get-Item $MsiPath).Length -lt $MinMsiSize) { throw "File too small." }
+}
+catch { Write-Log "Download failed: $_" "ERROR"; Exit-Smart 1 }
+
+Write-Log "Installing Liongard Agent..."
+$EnvArg = if (-not [string]::IsNullOrWhiteSpace($Environment)) { "LIONGARDENVIRONMENT=`"$Environment`"" } else { "" }
+$InstallLog = "$Folder\AgentInstall.log"
+$InstallArgs = "/i `"$MsiPath`" LIONGARDURL=$Url LIONGARDACCESSKEY=$AccessKey LIONGARDACCESSSECRET=$AccessSecret $EnvArg LIONGARDAGENTNAME=`"$env:computername`" /qn /norestart /L*V `"$InstallLog`""
+
+try {
+    $Process = Start-Process -FilePath "msiexec.exe" -ArgumentList $InstallArgs -Wait -PassThru -NoNewWindow
+    
+    if ($Process.ExitCode -ne 0 -and $Process.ExitCode -ne 3010) { 
+        $FailureReason = "Unknown MSI Error (Code $($Process.ExitCode))"
+        Start-Sleep -Seconds 2 # Wait for log flush
+        
+        if (Test-Path $InstallLog) {
+            $LogContent = Get-Content $InstallLog
+            $Validation = $LogContent | Select-String -Pattern "INVALIDMSG = (.*)" | Select-Object -Last 1
+            $StandardErr = $LogContent | Select-String -Pattern "Product: .* -- Error \d+" | Select-Object -Last 1
+            $InternalErr = $LogContent | Select-String -Pattern "Note: 1: \d+ 2: (.*)" | Select-Object -Last 1
+            
+            if ($Validation) { $FailureReason = "INPUT ERROR: $($Validation.Matches.Groups[1].Value)" }
+            elseif ($StandardErr) { $FailureReason = "SYSTEM ERROR: $($StandardErr.Line)" }
+            elseif ($InternalErr) { $FailureReason = "INSTALLER ERROR: $($InternalErr.Matches.Groups[1].Value)" }
+        }
+        throw $FailureReason
     }
 }
-catch {
-    $ErrorMessage = "FATAL ERROR: Agent installation failed during msiexec execution. Specific Error: $($_.Exception.Message)"
-    Write-Log $ErrorMessage
-    Write-Error $ErrorMessage
-    Write-Log "Terminating Script."
-    Exit 1
-}
+catch { Write-Log "$_" "ERROR"; Exit-Smart 1 }
 
-Write-Log "--- Script Finished Successfully ---"
-Exit 0
+# --- 7. Verification ---
+Write-Log "Verifying Service Startup (Max 120s)..."
+$Retry = 0; $Started = $false; $DetectedServiceName = $null
+do {
+    Start-Sleep -Seconds 5
+    $Service = Get-Service | Where-Object { $_.Name -like "*Liongard*" -or $_.DisplayName -like "*Liongard*" } | Select-Object -First 1
+    if ($Service -and $Service.Status -eq "Running") { $DetectedServiceName = $Service.Name; $Started = $true }
+    $Retry++
+} until ($Started -or $Retry -ge 24)
+
+if ($Started) { 
+    Write-Log "SUCCESS: Service '$DetectedServiceName' is Running." 
+    Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
+    Exit-Smart 0
+} else { 
+    Write-Log "WARNING: Service installed but not running." "WARN"
+    Exit-Smart 1
+}
