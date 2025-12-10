@@ -1,0 +1,86 @@
+Liongard Agent Deployment for N-able N-central
+Overview
+This PowerShell script installs the Liongard Agent on Windows endpoints. It is optimized for N-able N-central and uses explicit parameter passing to ensure every agent is assigned to the correct Environment in Liongard.
+
+Prerequisites
+1. Create a "Liongard Environment" Property (Recommended)
+To avoid typing the customer name manually for every single deployment, create a global variable in N-central once.
+
+Global Level: Go to Administration > Custom Properties.
+
+Click Add > By Customers.
+
+Name: Liongard_Environment_Name
+
+Type: Text
+
+Click Save.
+
+Populate: For each customer, edit their "Custom Properties" tab and paste their exact Liongard Environment Name (e.g., "Contoso Finance").
+
+2. Liongard API Keys
+Gather your Access Key ID and Access Key Secret from your Liongard instance (Admin > Account Settings > Access Tokens).
+
+Installation & Usage
+Method A: The Script Repository (Best Practice)
+This method gives you a clean UI with boxes to fill in.
+
+Upload:
+
+Go to Configuration > Scheduled Tasks > Script/Software Repository.
+
+Add a new Scripting item.
+
+Upload Install-Liongard.ps1.
+
+Parameters: Ensure AccessSecret is set to Password type (to hide it).
+
+Deploy:
+
+Select devices > Add Task > Run Script.
+
+Select the script from the repository.
+
+Map the Environment:
+
+Click the Mapping Icon (Database symbol) next to the Environment parameter.
+
+Select Liongard_Environment_Name.
+
+Result: N-central will automatically inject the correct customer name for every device.
+
+Method B: Manual "Ad-Hoc" Run (Testing)
+Use this for single-device tests or if you don't want to set up properties.
+
+Select a device > Add Task > Run Script.
+
+Select "From My Computer" and upload the .ps1 file.
+
+Command Line Parameters:
+
+You must manually construct the command string.
+
+Format:
+
+Plaintext
+
+-Url "your.instance.liongard.com" -AccessKey "YOUR_KEY" -AccessSecret "YOUR_SECRET" -Environment "Exact Customer Name"
+Example:
+
+Plaintext
+
+-Url "us1.app.liongard.com" -AccessKey "AB123..." -AccessSecret "XY987..." -Environment "Contoso Finance"
+Credentials: Select LocalSystem.
+
+Troubleshooting
+Logs
+The script generates logs locally on the endpoint:
+
+Script Log: C:\ProgramData\Liongard\ScriptInstall.log (Check this for parameter errors).
+
+MSI Log: C:\ProgramData\Liongard\AgentInstall.log (Check this for Windows Installer errors).
+
+Common Issues
+Agent Lands in "Unknown" Environment: This means the -Environment parameter was missing or misspelled. Check the Script Log to see what value was passed.
+
+"Missing Required Variables": You likely uploaded the script "From My Computer" but forgot to replace the filename in the "Command Line Parameters" box with the actual parameters.
