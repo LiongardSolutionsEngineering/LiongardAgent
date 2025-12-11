@@ -1,0 +1,73 @@
+<# 
+    Liongard Agent - AMP Version
+    Inputs are passed directly from Automation Manager variables.
+#>
+
+# --- 1. Map AMP Inputs to Script Variables ---
+# The variables $LiongardURL, $AccessKey, $AccessSecret, and $EnvironmentName 
+# are injected automatically by the AMP mapping we will do in the next step.
+
+$Url          = $LiongardURL
+$Environment  = $EnvironmentName
+
+# --- 2. Validation & Sanitization ---
+if ([string]::IsNullOrWhiteSpace($Environment)) {
+    Write-Host "FATAL ERROR: Environment Name is empty."
+    Exit 1
+}
+
+# Clean Environment Name (Trim spaces/quotes)
+$Environment = $Environment.Trim() -replace '"','' -replace "'",''
+
+# Clean URL
+$Url = $Url.ToLower().Trim()
+if ($Url -match "https://") { $Url = $Url -replace "https://","" -replace "/","" }
+if ($Url -notmatch "\.app\.liongard\.com") { $Url = "$Url.app.liongard.com" }
+
+Write-Host "Installing for Environment: $Environment"
+Write-Host "URL: $Url"
+
+# --- 3. Pre-Flight Checks ---
+if (Get-Service | Where-Object { $_.Name -like "*Liongard*" }) {
+    Write-Host "Liongard Agent already installed. Aborting."
+    Exit 0
+}
+
+# --- 4. Setup Paths ---
+$MsiPath     = "$env:TEMP\LiongardAgent-lts.msi" 
+$DownloadUri = "https://agents.static.liongard.com/LiongardAgent-lts.msi"
+$Folder      = "$env:ProgramData\Liongard"
+if (-not (Test-Path $Folder)) { New-Item -Path $Folder -ItemType Directory -Force | Out-Null }
+$InstallLog  = "$Folder\AgentInstall.log"
+
+# --- 5. Download ---
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+try { 
+    Invoke-WebRequest -Uri $DownloadUri -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop 
+}
+catch { 
+    Write-Host "Download failed: $_"
+    Exit 1 
+}
+
+# --- 6. Install ---
+# Note: We do not use the transcript here because AMP captures stdout automatically.
+$InstallArgs = "/i `"$MsiPath`" LIONGARDURL=$Url LIONGARDACCESSKEY=$AccessKey LIONGARDACCESSSECRET=$AccessSecret LIONGARDENVIRONMENT=`"$Environment`" LIONGARDAGENTNAME=`"$env:computername`" /qn /norestart /L*V `"$InstallLog`""
+
+$Process = Start-Process -FilePath "msiexec.exe" -ArgumentList $InstallArgs -Wait -PassThru -NoNewWindow
+
+if ($Process.ExitCode -ne 0 -and $Process.ExitCode -ne 3010) {
+    Write-Host "Installation Failed (Exit Code $($Process.ExitCode)). Check $InstallLog"
+    Exit 1
+}
+
+# --- 7. Verify ---
+Start-Sleep -Seconds 10
+if ((Get-Service | Where-Object { $_.Name -like "*Liongard*" }).Status -eq "Running") {
+    Write-Host "SUCCESS: Agent Installed and Running."
+    Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
+    Exit 0
+} else {
+    Write-Host "WARNING: Service installed but not running."
+    Exit 1
+}
