@@ -1,0 +1,104 @@
+<#
+.SYNOPSIS
+    Liongard Agent Installation - (v5.0 - N-central Automation Ready)
+.DESCRIPTION
+    - AUTOMATION FOCUSED: Designed to accept N-central Custom Properties (Variables).
+    - INPUT SANITIZATION: Automatically cleans up variable inputs (trims spaces, fixes URL case).
+    - ROBUST LOGGING: detailed logs at C:\ProgramData\Liongard\ScriptInstall.log
+#>
+param(
+    [string]$Url,
+    [string]$AccessKey,
+    [string]$AccessSecret,
+    [Parameter(Mandatory=$true)]
+    [string]$Environment
+)
+
+# --- 0. Setup & Logging ---
+$Folder          = "$env:ProgramData\Liongard"
+$LogFile         = "$Folder\ScriptInstall.log"
+$TranscriptPath  = "$Folder\TranscriptLog.txt"
+
+if (-not (Test-Path -Path $Folder)) { New-Item -Path $Folder -ItemType Directory -ErrorAction SilentlyContinue | Out-Null }
+try { Start-Transcript -Path $TranscriptPath -Append -Force -ErrorAction Stop } catch { Write-Host "WARNING: No Transcript." }
+
+function Write-Log {
+    param( [string]$Message, [string]$Type="INFO" )
+    $Entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Type] $Message"
+    Write-Host $Entry
+    Add-Content -Path $LogFile -Value $Entry -ErrorAction SilentlyContinue
+}
+
+Write-Log "--- Starting Liongard Agent Installation (Automation Mode) ---"
+
+# --- 1. Validation & Variable Sanitization ---
+
+# 1A. Validate Environment Variable
+if ([string]::IsNullOrWhiteSpace($Environment)) {
+    Write-Log "FATAL ERROR: 'Environment' parameter is empty." "ERROR"
+    Write-Log "Check your N-central Custom Property mapping. The variable passed a null value." "ERROR"
+    Stop-Transcript
+    Exit 1
+}
+
+# 1B. Sanitize Environment (Trim spaces from the variable)
+$Environment = $Environment.Trim()
+# Remove quotes if the variable included them
+$Environment = $Environment -replace '"','' -replace "'",''
+
+Write-Log "Target Environment: '$Environment'"
+
+# 1C. Validate Keys
+if (-not $Url -or -not $AccessKey -or -not $AccessSecret) {
+    Write-Log "FATAL ERROR: Missing URL, Key, or Secret." "ERROR"
+    Stop-Transcript
+    Exit 1
+}
+
+# 1D. Sanitize URL (Force Lowercase per Liongard requirements & remove protocol)
+$Url = $Url.ToLower().Trim()
+if ($Url -match "https://") { $Url = $Url -replace "https://","" -replace "/","" }
+if ($Url -notmatch "\.app\.liongard\.com") { $Url = "$Url.app.liongard.com" }
+Write-Log "Sanitized URL: $Url"
+
+# --- 2. Pre-Flight Checks ---
+if (Get-Service | Where-Object { $_.Name -like "*Liongard*" }) {
+    Write-Log "Liongard Agent already installed. Aborting." "WARN"
+    Stop-Transcript
+    Exit 0
+}
+
+# --- 3. Download ---
+$MsiPath     = "$env:TEMP\LiongardAgent-lts.msi" 
+$DownloadUri = "https://agents.static.liongard.com/LiongardAgent-lts.msi"
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+Write-Log "Downloading MSI..."
+try { Invoke-WebRequest -Uri $DownloadUri -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop }
+catch { Write-Log "Download failed: $_" "ERROR"; Exit 1 }
+
+# --- 4. Install ---
+Write-Log "Installing..."
+$InstallLog = "$Folder\AgentInstall.log"
+
+# We wrap the sanitized $Environment in quotes here to handle spaces (e.g., "Contoso Finance")
+$InstallArgs = "/i `"$MsiPath`" LIONGARDURL=$Url LIONGARDACCESSKEY=$AccessKey LIONGARDACCESSSECRET=$AccessSecret LIONGARDENVIRONMENT=`"$Environment`" LIONGARDAGENTNAME=`"$env:computername`" /qn /norestart /L*V `"$InstallLog`""
+
+$Process = Start-Process -FilePath "msiexec.exe" -ArgumentList $InstallArgs -Wait -PassThru -NoNewWindow
+
+if ($Process.ExitCode -ne 0 -and $Process.ExitCode -ne 3010) {
+    Write-Log "Installation Failed (Exit Code $($Process.ExitCode)). Check $InstallLog" "ERROR"
+    Stop-Transcript
+    Exit 1
+}
+
+# --- 5. Verify ---
+Start-Sleep -Seconds 10
+if ((Get-Service | Where-Object { $_.Name -like "*Liongard*" }).Status -eq "Running") {
+    Write-Log "SUCCESS: Agent Installed and Running."
+    Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
+    Exit 0
+} else {
+    Write-Log "WARNING: Service installed but not running." "WARN"
+    Exit 1
+}
