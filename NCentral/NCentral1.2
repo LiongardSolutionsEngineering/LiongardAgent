@@ -1,0 +1,97 @@
+<#
+.SYNOPSIS
+    Liongard Agent Installation - (v4.0 - Manual Input Only)
+.DESCRIPTION
+    - STRICT MANUAL INPUT: Will ONLY use the Environment Name provided by the technician.
+    - NO AUTO-DISCOVERY: Does not look at RMM Agent Config files.
+    - NO GUESSING: If the name is blank, the script fails immediately.
+#>
+param(
+    [string]$Url,
+    [string]$AccessKey,
+    [string]$AccessSecret,
+    [Parameter(Mandatory=$true)]
+    [string]$Environment
+)
+
+# --- 0. Setup & Logging ---
+$Folder          = "$env:ProgramData\Liongard"
+$LogFile         = "$Folder\ScriptInstall.log"
+$TranscriptPath  = "$Folder\TranscriptLog.txt"
+
+if (-not (Test-Path -Path $Folder)) { New-Item -Path $Folder -ItemType Directory -ErrorAction SilentlyContinue | Out-Null }
+try { Start-Transcript -Path $TranscriptPath -Append -Force -ErrorAction Stop } catch { Write-Host "WARNING: No Transcript." }
+
+function Write-Log {
+    param( [string]$Message, [string]$Type="INFO" )
+    $Entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Type] $Message"
+    Write-Host $Entry
+    Add-Content -Path $LogFile -Value $Entry -ErrorAction SilentlyContinue
+}
+
+# --- 1. Validation (Strict) ---
+Write-Log "--- Starting Liongard Agent Installation (Manual Input Only) ---"
+
+# Check if the Technician actually typed something
+if ([string]::IsNullOrWhiteSpace($Environment)) {
+    Write-Log "FATAL ERROR: Environment Name is EMPTY." "ERROR"
+    Write-Log "You must enter the Liongard Environment Name in the N-central script parameters." "ERROR"
+    Stop-Transcript
+    Exit 1
+}
+
+if (-not $Url -or -not $AccessKey -or -not $AccessSecret) {
+    Write-Log "FATAL ERROR: Missing URL, Key, or Secret." "ERROR"
+    Stop-Transcript
+    Exit 1
+}
+
+Write-Log "Using Manual Environment Name: '$Environment'"
+
+# --- 2. Setup & Sanitization ---
+if ($Url -match "https://") { $Url = $Url -replace "https://","" -replace "/","" }
+if ($Url -notmatch "\.app\.liongard\.com") { $Url = "$Url.app.liongard.com" }
+
+# Remove accidentally typed quotes from the manual input
+$Environment = $Environment -replace '"',''
+
+$MsiPath     = "$env:TEMP\LiongardAgent-lts.msi" 
+$DownloadUri = "https://agents.static.liongard.com/LiongardAgent-lts.msi"
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+# --- 3. Pre-Flight Checks ---
+if (Get-Service | Where-Object { $_.Name -like "*Liongard*" }) {
+    Write-Log "Liongard Agent already installed. Aborting to prevent duplicates." "WARN"
+    Stop-Transcript
+    Exit 0
+}
+
+# --- 4. Download ---
+Write-Log "Downloading MSI..."
+try { Invoke-WebRequest -Uri $DownloadUri -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop }
+catch { Write-Log "Download failed: $_" "ERROR"; Exit 1 }
+
+# --- 5. Install ---
+Write-Log "Installing..."
+$InstallLog = "$Folder\AgentInstall.log"
+# We wrap the manually entered Environment in quotes here to handle spaces (e.g., "Acme Corp")
+$InstallArgs = "/i `"$MsiPath`" LIONGARDURL=$Url LIONGARDACCESSKEY=$AccessKey LIONGARDACCESSSECRET=$AccessSecret LIONGARDENVIRONMENT=`"$Environment`" LIONGARDAGENTNAME=`"$env:computername`" /qn /norestart /L*V `"$InstallLog`""
+
+$Process = Start-Process -FilePath "msiexec.exe" -ArgumentList $InstallArgs -Wait -PassThru -NoNewWindow
+
+if ($Process.ExitCode -ne 0 -and $Process.ExitCode -ne 3010) {
+    Write-Log "Installation Failed (Exit Code $($Process.ExitCode)). Check $InstallLog" "ERROR"
+    Stop-Transcript
+    Exit 1
+}
+
+# --- 6. Verify ---
+Start-Sleep -Seconds 10
+if ((Get-Service | Where-Object { $_.Name -like "*Liongard*" }).Status -eq "Running") {
+    Write-Log "SUCCESS: Agent Installed and Running."
+    Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
+    Exit 0
+} else {
+    Write-Log "WARNING: Service installed but not running." "WARN"
+    Exit 1
+}
