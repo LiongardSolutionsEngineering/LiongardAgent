@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Liongard Agent Installation - Production Ready (v2.3.3)
+    Liongard Agent Installation - Production Ready (v2.3.4)
 
 .DESCRIPTION
     - Enforced Inputs: Friendly loop for humans, graceful exit for RMMs.
@@ -13,7 +13,8 @@
         liongardaccesssecret
         liongardenvironment (optional)
     - Environment Special Characters: Supports URL-encoded environment names in liongardenvironment.
-      Example: "Will%20%26%20Bill" -> "Will & Bill"
+      Handles both %20 and + for spaces.
+      Example: "Kantor%20%26%20Kantor%2C%20LLP%20-%20KKLLP" -> "Kantor & Kantor, LLP - KKLLP"
     - Debug: Logs which required inputs are missing and what was detected (no secrets printed).
 #>
 
@@ -67,12 +68,13 @@ if ([string]::IsNullOrWhiteSpace($Environment)) {
 }
 
 # --- Decode Environment if it was URL-encoded ---
-# Example: "Kantor%20%26%20Kantor" -> "Kantor & Kantor"
+# Handles %20 and + for spaces.
 $EnvironmentWasUrlDecoded = $false
 if (-not [string]::IsNullOrWhiteSpace($Environment)) {
     $envBefore = $Environment
     try {
-        $decoded = [System.Uri]::UnescapeDataString($Environment)
+        $normalized = $Environment -replace '\+',' '   # some encoders use + for spaces
+        $decoded = [System.Uri]::UnescapeDataString($normalized)
         if (-not [string]::IsNullOrWhiteSpace($decoded) -and $decoded -ne $Environment) {
             $Environment = $decoded
             $EnvironmentWasUrlDecoded = $true
@@ -133,7 +135,7 @@ function Get-SourceLabel {
     return "Missing"
 }
 
-Write-Log "--- Starting Liongard Agent Installation (v2.3.3) ---"
+Write-Log "--- Starting Liongard Agent Installation (v2.3.4) ---"
 Write-Log ("Script Variable sources: Url={0}, AccessKey={1}, AccessSecret={2}, Environment={3}" -f `
     (Get-SourceLabel $UrlFromArg $UrlFromScriptVar $Url), `
     (Get-SourceLabel $AccessKeyFromArg $AccessKeyFromScriptVar $AccessKey), `
