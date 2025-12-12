@@ -1,0 +1,293 @@
+<#
+
+.SYNOPSIS
+
+    Liongard Agent Installation - Production Ready (v2.3)
+
+.DESCRIPTION
+
+    - Hardcoded Inputs: RMM parameter passing is bypassed.
+
+    - Race Condition Fix: Waits for MSI logs to flush.
+
+    - Deep Error Analysis: Explains failures (401, Invalid URL, etc).
+
+#>
+ 
+# =======================================================
+
+# --- HARDCODED VARIABLES (INPUTS) ---
+
+# NOTE: YOU MUST REPLACE THE PLACEHOLDERS BELOW
+
+# =======================================================
+ 
+[string]$url          = "YOUR_LIONGARD_URL_HERE"         # e.g., "acme" if your URL is https://acme.app.liongard.com
+
+[string]$accesskey    = "YOUR_ACCESS_KEY_ID_HERE"        # e.g., "AKID1234567890ABCDEF"
+
+[string]$accesssecret = "YOUR_ACCESS_KEY_SECRET_HERE"    # e.g., "SECRT1234567890ABCDEF"
+
+[string]$environment  = "YOUR_ENVIRONMENT_NAME_HERE"     # OPTIONAL: e.g., "Managed Desktops" - Can be left ""
+ 
+# =======================================================
+
+# --- ORIGINAL PARAMETERS ARE KEPT AS COMMENTS ---
+
+# param(
+
+#     [string]$url,
+
+#     [string]$accesskey,
+
+#     [string]$accesssecret,
+
+#     [string]$environment
+
+# )
+
+# =======================================================
+ 
+ 
+# --- 0. Setup & Logging ---
+
+$Folder          = "$env:ProgramData\Liongard"
+
+$LogFile         = "$Folder\ScriptInstall.log"
+
+$TranscriptPath  = "$Folder\TranscriptLog.txt"
+ 
+if (-not (Test-Path -Path $Folder)) { New-Item -Path $Folder -ItemType Directory -ErrorAction SilentlyContinue | Out-Null }
+ 
+try { Start-Transcript -Path $TranscriptPath -Append -Force -ErrorAction Stop } 
+
+catch { Write-Host "WARNING: Transcript failed. Proceeding without it." -ForegroundColor Yellow }
+ 
+function Write-Log {
+
+    param( [string]$Message, [string]$Type="INFO" )
+
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    $LogEntry = "[$Timestamp] [$Type] $Message"
+
+    Write-Host $LogEntry
+
+    Add-Content -Path $LogFile -Value $LogEntry -Encoding Default -ErrorAction SilentlyContinue
+
+}
+ 
+function Exit-Smart {
+
+    param ([int]$Code)
+
+    Stop-Transcript -ErrorAction SilentlyContinue
+
+    if ([Environment]::UserInteractive) {
+
+        Write-Host "`n---------------------------------------------------"
+
+        if ($Code -ne 0) { Write-Host "SCRIPT FAILED (Exit Code $Code) - Check logs above." -ForegroundColor Red }
+
+        else { Write-Host "SCRIPT FINISHED SUCCESSFULLY" -ForegroundColor Green }
+
+        Write-Host "---------------------------------------------------"
+
+        Read-Host "Press Enter to close this window..."
+
+    }
+
+    Exit $Code
+
+}
+ 
+# --- 1. The "Friendly Enforcer" Input Function (No longer used, but kept for flow) ---
+
+function Get-RequiredInput {
+
+    param ( [string]$CurrentValue, [string]$PromptName )
+
+    # Since we are hardcoding, we always use the value, bypassing the RMM check
+
+    return $CurrentValue
+
+}
+ 
+Write-Log "--- Starting Liongard Agent Installation (v2.3) ---"
+ 
+# --- 2. Get Inputs (with Enforcement) ---
+
+# The variables are already set, so we just run the input check once to ensure they exist.
+
+$url          = Get-RequiredInput -CurrentValue $url          -PromptName "1. Liongard URL"
+
+$accesskey    = Get-RequiredInput -CurrentValue $accesskey    -PromptName "2. Access Key ID"
+
+$accesssecret = Get-RequiredInput -CurrentValue $accesssecret -PromptName "3. Access Key Secret"
+
+# Environment is set by the hardcoded value or left blank
+
+# The interactive prompt logic is now removed/bypassed.
+ 
+ 
+# --- 3. RMM Graceful Handling (Validation) ---
+
+if ([string]::IsNullOrWhiteSpace($url) -or [string]::IsNullOrWhiteSpace($accesskey) -or [string]::IsNullOrWhiteSpace($accesssecret)) {
+
+    Write-Log "FATAL ERROR: Hardcoded variables are missing or blank. Please check the script code." "ERROR"
+
+    Exit-Smart 1
+
+}
+ 
+# --- 4. Sanitization ---
+
+if ($url -match "https://") { $url = $url -replace "https://","" -replace "/","" }
+
+if ($url -notmatch "\.app\.liongard\.com") {
+
+    $url = "$url.app.liongard.com"
+
+    Write-Log "Auto-corrected URL to: $url"
+
+}
+ 
+$MsiPath         = "$env:TEMP\LiongardAgent-lts.msi" 
+
+$DownloadUri     = "https://agents.static.liongard.com/LiongardAgent-lts.msi"
+
+$MinMsiSize      = 10485760 
+
+$MinFreeSpaceMB  = 200
+
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+ 
+# --- 5. Pre-Flight Checks ---
+
+Write-Log "Checking for existing Liongard Agent Service..."
+
+if (Get-Service | Where-Object { $_.Name -like "*Liongard*" -or $_.DisplayName -like "*Liongard*" }) {
+
+    Write-Log "A Liongard Agent service is already present. Aborting." "WARN"
+
+    Exit-Smart 0
+
+}
+ 
+try {
+
+    $Disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" | Select-Object FreeSpace
+
+    if (([math]::Round($Disk.FreeSpace / 1MB)) -lt $MinFreeSpaceMB) { throw "Insufficient disk space." }
+
+    Write-Log "Verifying connectivity..."
+
+    $Request = [System.Net.WebRequest]::Create($DownloadUri); $Request.Method = "HEAD"; $Response = $Request.GetResponse(); $Response.Close()
+
+}
+
+catch { Write-Log "Pre-check failed: $_" "ERROR"; Exit-Smart 1 }
+ 
+# --- 6. Download & Install ---
+
+Write-Log "Downloading MSI..."
+
+try {
+
+    Invoke-WebRequest -Uri $DownloadUri -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop
+
+    if ((Get-Item $MsiPath).Length -lt $MinMsiSize) { throw "File too small." }
+
+}
+
+catch { Write-Log "Download failed: $_" "ERROR"; Exit-Smart 1 }
+ 
+Write-Log "Installing Liongard Agent..."
+
+$EnvArg = if (-not [string]::IsNullOrWhiteSpace($environment)) { "LIONGARDENVIRONMENT=`"$environment`"" } else { "" }
+
+$InstallLog = "$Folder\AgentInstall.log"
+
+$InstallArgs = "/i `"$MsiPath`" LIONGARDURL=$url LIONGARDACCESSKEY=$accesskey LIONGARDACCESSSECRET=$accesssecret $EnvArg LIONGARDAGENTNAME=`"$env:computername`" /qn /norestart /L*V `"$InstallLog`""
+ 
+try {
+
+    $Process = Start-Process -FilePath "msiexec.exe" -ArgumentList $InstallArgs -Wait -PassThru -NoNewWindow
+
+    if ($Process.ExitCode -ne 0 -and $Process.ExitCode -ne 3010) { 
+
+        $FailureReason = "Unknown MSI Error (Code $($Process.ExitCode))"
+
+        Start-Sleep -Seconds 2 # Wait for log flush
+
+        if (Test-Path $InstallLog) {
+
+            $LogContent = Get-Content $InstallLog
+
+            $Validation = $LogContent | Select-String -Pattern "INVALIDMSG = (.*)" | Select-Object -Last 1
+
+            $StandardErr = $LogContent | Select-String -Pattern "Product: .* -- Error \d+" | Select-Object -Last 1
+
+            $InternalErr = $LogContent | Select-String -Pattern "Note: 1: \d+ 2: (.*)" | Select-Object -Last 1
+
+            if ($Validation) { $FailureReason = "INPUT ERROR: $($Validation.Matches.Groups[1].Value)" }
+
+            elseif ($StandardErr) { $FailureReason = "SYSTEM ERROR: $($StandardErr.Line)" }
+
+            elseif ($InternalErr) { $FailureReason = "INSTALLER ERROR: $($InternalErr.Matches.Groups[1].Value)" }
+
+        }
+
+        throw $FailureReason
+
+    }
+
+}
+
+catch { Write-Log "$_" "ERROR"; Exit-Smart 1 }
+ 
+# --- 7. Verification ---
+
+Write-Log "Verifying Service Startup (Max 120s)..."
+
+$Retry = 0; $Started = $false; $DetectedServiceName = $null
+
+do {
+
+    Start-Sleep -Seconds 5
+
+    $Service = Get-Service | Where-Object { $_.Name -like "*Liongard*" -or $_.DisplayName -like "*Liongard*" } | Select-Object -First 1
+
+    if ($Service -and $Service.Status -eq "Running") { $DetectedServiceName = $Service.Name; $Started = $true }
+
+    $Retry++
+
+} until ($Started -or $Retry -ge 24)
+ 
+if ($Started) { 
+
+    Write-Log "SUCCESS: Service '$DetectedServiceName' is Running." 
+
+    Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
+
+    Exit-Smart 0
+
+} else { 
+
+    Write-Log "WARNING: Service installed but not running." "WARN"
+
+    Exit-Smart 1
+
+}
+ 
+# --- NinjaOne Custom Field Fallbacks (recommended) ---
+
+if ([string]::IsNullOrWhiteSpace($Url))          { $Url          = Ninja-Property-Get liongard_url }
+
+if ([string]::IsNullOrWhiteSpace($AccessKey))    { $AccessKey    = Ninja-Property-Get liongard_accesskey }
+
+if ([string]::IsNullOrWhiteSpace($AccessSecret)) { $AccessSecret = Ninja-Property-Get liongard_accesssecret }
+
+if ([string]::IsNullOrWhiteSpace($Environment))  { $Environment  = Ninja-Property-Get liongard_environment }
+
+ 
