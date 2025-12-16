@@ -1,0 +1,153 @@
+<#
+.SYNOPSIS
+    Liongard Agent Installation - Universal Hardcoded (v2.4)
+.DESCRIPTION
+    - Standalone: No RMM parameters required. Variables are defined at the top.
+    - Smart Decoding: Handles URL encoded environment names (e.g. "Company%20Name").
+    - Race Condition Fix: Waits for MSI logs to flush.
+    - Deep Error Analysis: Explains failures (401, Invalid URL, etc).
+#>
+
+# =======================================================
+# --- CONFIGURATION (EDIT THIS SECTION) ---
+# =======================================================
+
+[string]$Url          = "YOUR_LIONGARD_URL"        # e.g. "us1.app.liongard.com"
+[string]$AccessKey    = "YOUR_ACCESS_KEY"          # e.g. "AKID12345..."
+[string]$AccessSecret = "YOUR_ACCESS_SECRET"       # e.g. "SECRET12345..."
+[string]$Environment  = "YOUR_ENV_NAME"            # Optional. Can use "Name" or "Name%20Here"
+
+# =======================================================
+# --- SCRIPT LOGIC (DO NOT EDIT BELOW) ---
+# =======================================================
+
+# --- 1. Sanitization & Smart Decoding ---
+# Auto-correct URL (remove https://)
+if ($Url -match "https://") { $Url = $Url -replace "https://","" -replace "/","" }
+if ($Url -notmatch "\.app\.liongard\.com") { $Url = "$Url.app.liongard.com"; Write-Host "Auto-corrected URL to: $Url" }
+
+# Auto-decode Environment (Fixes %20 or + for spaces)
+if (-not [string]::IsNullOrWhiteSpace($Environment)) {
+    try {
+        $normalized = $Environment -replace '\+',' '
+        $decoded = [System.Uri]::UnescapeDataString($normalized)
+        if ($decoded -ne $Environment) { 
+            $Environment = $decoded
+            Write-Host "Auto-decoded Environment name to: '$Environment'"
+        }
+    } catch {}
+}
+
+# --- 2. Setup & Logging ---
+$Folder          = "$env:ProgramData\Liongard"
+$LogFile         = "$Folder\ScriptInstall.log"
+$TranscriptPath  = "$Folder\TranscriptLog.txt"
+
+if (-not (Test-Path -Path $Folder)) { New-Item -Path $Folder -ItemType Directory -ErrorAction SilentlyContinue | Out-Null }
+try { Start-Transcript -Path $TranscriptPath -Append -Force -ErrorAction Stop } 
+catch { Write-Host "WARNING: Transcript failed. Proceeding without it." -ForegroundColor Yellow }
+
+function Write-Log {
+    param( [string]$Message, [string]$Type="INFO" )
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $LogEntry = "[$Timestamp] [$Type] $Message"
+    Write-Host $LogEntry
+    Add-Content -Path $LogFile -Value $LogEntry -Encoding Default -ErrorAction SilentlyContinue
+}
+
+function Exit-Smart {
+    param ([int]$Code)
+    Stop-Transcript -ErrorAction SilentlyContinue
+    if ([Environment]::UserInteractive) {
+        Write-Host "`n---------------------------------------------------"
+        if ($Code -ne 0) { Write-Host "SCRIPT FAILED (Exit Code $Code) - Check logs above." -ForegroundColor Red }
+        else { Write-Host "SCRIPT FINISHED SUCCESSFULLY" -ForegroundColor Green }
+        Write-Host "---------------------------------------------------"
+        Read-Host "Press Enter to close this window..."
+    }
+    Exit $Code
+}
+
+Write-Log "--- Starting Liongard Agent Installation (Universal v2.4) ---"
+
+# --- 3. Validation ---
+if ([string]::IsNullOrWhiteSpace($Url) -or [string]::IsNullOrWhiteSpace($AccessKey) -or [string]::IsNullOrWhiteSpace($AccessSecret) -or $Url -match "YOUR_") {
+    Write-Log "FATAL ERROR: You must edit the CONFIGURATION section at the top of this script with real credentials." "ERROR"
+    Exit-Smart 1
+}
+
+$MsiPath         = "$env:TEMP\LiongardAgent-lts.msi" 
+$DownloadUri     = "https://agents.static.liongard.com/LiongardAgent-lts.msi"
+$MinMsiSize      = 10485760 
+$MinFreeSpaceMB  = 200
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+# --- 4. Pre-Flight Checks ---
+Write-Log "Checking for existing Liongard Agent Service..."
+if (Get-Service | Where-Object { $_.Name -like "*Liongard*" -or $_.DisplayName -like "*Liongard*" }) {
+    Write-Log "A Liongard Agent service is already present. Aborting." "WARN"
+    Exit-Smart 0
+}
+
+try {
+    $Disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" | Select-Object FreeSpace
+    if (([math]::Round($Disk.FreeSpace / 1MB)) -lt $MinFreeSpaceMB) { throw "Insufficient disk space." }
+    
+    Write-Log "Verifying connectivity..."
+    $Request = [System.Net.WebRequest]::Create($DownloadUri); $Request.Method = "HEAD"; $Response = $Request.GetResponse(); $Response.Close()
+}
+catch { Write-Log "Pre-check failed: $_" "ERROR"; Exit-Smart 1 }
+
+# --- 5. Download & Install ---
+Write-Log "Downloading MSI..."
+try {
+    Invoke-WebRequest -Uri $DownloadUri -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop
+    if ((Get-Item $MsiPath).Length -lt $MinMsiSize) { throw "File too small." }
+}
+catch { Write-Log "Download failed: $_" "ERROR"; Exit-Smart 1 }
+
+Write-Log "Installing Liongard Agent..."
+$EnvArg = if (-not [string]::IsNullOrWhiteSpace($Environment)) { "LIONGARDENVIRONMENT=`"$Environment`"" } else { "" }
+$InstallLog = "$Folder\AgentInstall.log"
+$InstallArgs = "/i `"$MsiPath`" LIONGARDURL=$Url LIONGARDACCESSKEY=$AccessKey LIONGARDACCESSSECRET=$AccessSecret $EnvArg LIONGARDAGENTNAME=`"$env:computername`" /qn /norestart /L*V `"$InstallLog`""
+
+try {
+    $Process = Start-Process -FilePath "msiexec.exe" -ArgumentList $InstallArgs -Wait -PassThru -NoNewWindow
+    
+    if ($Process.ExitCode -ne 0 -and $Process.ExitCode -ne 3010) { 
+        $FailureReason = "Unknown MSI Error (Code $($Process.ExitCode))"
+        Start-Sleep -Seconds 2 # Wait for log flush
+        
+        if (Test-Path $InstallLog) {
+            $LogContent = Get-Content $InstallLog
+            $Validation = $LogContent | Select-String -Pattern "INVALIDMSG = (.*)" | Select-Object -Last 1
+            $StandardErr = $LogContent | Select-String -Pattern "Product: .* -- Error \d+" | Select-Object -Last 1
+            $InternalErr = $LogContent | Select-String -Pattern "Note: 1: \d+ 2: (.*)" | Select-Object -Last 1
+            
+            if ($Validation) { $FailureReason = "INPUT ERROR: $($Validation.Matches.Groups[1].Value)" }
+            elseif ($StandardErr) { $FailureReason = "SYSTEM ERROR: $($StandardErr.Line)" }
+            elseif ($InternalErr) { $FailureReason = "INSTALLER ERROR: $($InternalErr.Matches.Groups[1].Value)" }
+        }
+        throw $FailureReason
+    }
+}
+catch { Write-Log "$_" "ERROR"; Exit-Smart 1 }
+
+# --- 6. Verification ---
+Write-Log "Verifying Service Startup (Max 120s)..."
+$Retry = 0; $Started = $false; $DetectedServiceName = $null
+do {
+    Start-Sleep -Seconds 5
+    $Service = Get-Service | Where-Object { $_.Name -like "*Liongard*" -or $_.DisplayName -like "*Liongard*" } | Select-Object -First 1
+    if ($Service -and $Service.Status -eq "Running") { $DetectedServiceName = $Service.Name; $Started = $true }
+    $Retry++
+} until ($Started -or $Retry -ge 24)
+
+if ($Started) { 
+    Write-Log "SUCCESS: Service '$DetectedServiceName' is Running." 
+    Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
+    Exit-Smart 0
+} else { 
+    Write-Log "WARNING: Service installed but not running." "WARN"
+    Exit-Smart 1
+}
