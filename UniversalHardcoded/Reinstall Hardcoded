@@ -1,0 +1,230 @@
+<#
+.SYNOPSIS
+    Liongard Agent RE-INSTALLATION - Production Ready (v2.5)
+.DESCRIPTION
+    - Actions: Downloads fresh MSI -> Removes Old Agent -> Deep Cleans Registry -> Installs New Agent.
+    - Deep Clean: Fixes Error 1612 by removing "ghost" entries in HKCR\Installer\Products.
+    - Configuration: Supports Hardcoded variables, Parameters, or Interactive Prompts.
+#>
+
+# --- 0. CONFIGURATION (HARDCODE VALUES HERE) ---
+# Enter values inside the quotes to bypass prompts. 
+$Hardcoded_Url          = ""   # e.g. "instance.app.liongard.com"
+$Hardcoded_AccessKey    = ""   # e.g. "BnKs..."
+$Hardcoded_AccessSecret = ""   # e.g. "89s7..."
+$Hardcoded_Environment  = ""   # Optional
+
+# --- Parameters (For RMM overrides) ---
+param(
+    [string]$Url,
+    [string]$AccessKey,
+    [string]$AccessSecret,
+    [string]$Environment
+)
+
+# --- 1. Logic: Prioritize Hardcoded -> Param -> Prompt ---
+if (-not [string]::IsNullOrWhiteSpace($Hardcoded_Url))          { $Url = $Hardcoded_Url }
+if (-not [string]::IsNullOrWhiteSpace($Hardcoded_AccessKey))    { $AccessKey = $Hardcoded_AccessKey }
+if (-not [string]::IsNullOrWhiteSpace($Hardcoded_AccessSecret)) { $AccessSecret = $Hardcoded_AccessSecret }
+if (-not [string]::IsNullOrWhiteSpace($Hardcoded_Environment))  { $Environment = $Hardcoded_Environment }
+
+# --- 2. Setup & Logging ---
+$Folder          = "$env:ProgramData\Liongard"
+$LogFile         = "$Folder\ScriptReinstall.log"
+$TranscriptPath  = "$Folder\TranscriptReinstall.txt"
+
+if (-not (Test-Path -Path $Folder)) { New-Item -Path $Folder -ItemType Directory -ErrorAction SilentlyContinue | Out-Null }
+
+try { Start-Transcript -Path $TranscriptPath -Append -Force -ErrorAction Stop } 
+catch { Write-Host "WARNING: Transcript failed. Proceeding without it." -ForegroundColor Yellow }
+
+function Write-Log {
+    param( [string]$Message, [string]$Type="INFO" )
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $LogEntry = "[$Timestamp] [$Type] $Message"
+    Write-Host $LogEntry
+    Add-Content -Path $LogFile -Value $LogEntry -Encoding Default -ErrorAction SilentlyContinue
+}
+
+function Exit-Smart {
+    param ([int]$Code)
+    Stop-Transcript -ErrorAction SilentlyContinue
+    if ([Environment]::UserInteractive) {
+        Write-Host "`n---------------------------------------------------"
+        if ($Code -ne 0) { Write-Host "SCRIPT FAILED (Exit Code $Code) - Check logs above." -ForegroundColor Red }
+        else { Write-Host "SCRIPT FINISHED SUCCESSFULLY" -ForegroundColor Green }
+        Write-Host "---------------------------------------------------"
+        Read-Host "Press Enter to close this window..."
+    }
+    Exit $Code
+}
+
+# --- 3. The "Friendly Enforcer" Input Function ---
+function Get-RequiredInput {
+    param ( [string]$CurrentValue, [string]$PromptName )
+    if (-not [string]::IsNullOrWhiteSpace($CurrentValue)) { return $CurrentValue }
+    if (-not [Environment]::UserInteractive) { return $null }
+    $Val = $null
+    do {
+        $Val = Read-Host "`n$PromptName (Required)"
+        if ([string]::IsNullOrWhiteSpace($Val)) { Write-Host "   [!] Required." -ForegroundColor Yellow }
+    } until (-not [string]::IsNullOrWhiteSpace($Val))
+    return $Val
+}
+
+Write-Log "--- Starting Liongard Agent RE-INSTALLATION (v2.5 - Deep Clean) ---"
+
+# --- 4. Validation & Sanitization ---
+$Url          = Get-RequiredInput -CurrentValue $Url          -PromptName "1. Liongard URL"
+$AccessKey    = Get-RequiredInput -CurrentValue $AccessKey    -PromptName "2. Access Key ID"
+$AccessSecret = Get-RequiredInput -CurrentValue $AccessSecret -PromptName "3. Access Key Secret"
+
+if ([string]::IsNullOrWhiteSpace($Environment) -and [Environment]::UserInteractive) {
+    $Environment = Read-Host "`n4. Environment Name (Optional)"
+}
+
+if (-not $Url -or -not $AccessKey -or -not $AccessSecret) {
+    Write-Log "FATAL ERROR: Missing required variables." "ERROR"
+    Exit-Smart 1
+}
+
+if ($Url -match "https://") { $Url = $Url -replace "https://","" -replace "/","" }
+if ($Url -notmatch "\.app\.liongard\.com") { $Url = "$Url.app.liongard.com"; Write-Log "Auto-corrected URL to: $Url" }
+
+$MsiPath         = "$env:TEMP\LiongardAgent-lts.msi" 
+$DownloadUri     = "https://agents.static.liongard.com/LiongardAgent-lts.msi"
+$MinMsiSize      = 10485760 
+$MinFreeSpaceMB  = 200
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+# --- 5. Download FRESH MSI ---
+Write-Log "Downloading Latest MSI..."
+try {
+    $Disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" | Select-Object FreeSpace
+    if (([math]::Round($Disk.FreeSpace / 1MB)) -lt $MinFreeSpaceMB) { throw "Insufficient disk space." }
+    Invoke-WebRequest -Uri $DownloadUri -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop
+    if ((Get-Item $MsiPath).Length -lt $MinMsiSize) { throw "File too small/Corrupt download." }
+}
+catch { Write-Log "Download failed: $_" "ERROR"; Exit-Smart 1 }
+
+# --- 6. Detection & Removal Logic (Standard) ---
+Write-Log "Phase 1: Standard Removal Checks..."
+$ExistingService = Get-Service | Where-Object { $_.Name -like "*Liongard*" -or $_.DisplayName -like "*Liongard*" }
+
+if ($ExistingService) {
+    Write-Log "Existing Agent Found: $($ExistingService.Name)."
+    if ($ExistingService.Status -eq 'Running') {
+        Stop-Service $ExistingService.Name -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 5
+    }
+
+    $UninstallKey = Get-ChildItem -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall, HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall -ErrorAction SilentlyContinue |
+        Get-ItemProperty | Where-Object { $_.DisplayName -like "*Liongard Agent*" } | Select-Object -First 1
+
+    if ($UninstallKey) {
+        $UninstallString = $UninstallKey.UninstallString
+        if ($UninstallString -match "MsiExec.exe") {
+            $ProductCode = ($UninstallString -replace "MsiExec.exe", "" -replace "/I", "" -replace "/X", "").Trim()
+            Write-Log "Uninstalling Standard Product Code: $ProductCode"
+            $Proc = Start-Process "msiexec.exe" -ArgumentList "/x $ProductCode /qn /norestart" -Wait -PassThru
+            Write-Log "Standard Uninstall Exit Code: $($Proc.ExitCode)"
+        }
+    }
+}
+
+# --- 6.5. Deep Clean Logic (Fix for Error 1612) ---
+Write-Log "Phase 2: Deep Registry Clean (Hunting for Ghost/Corrupted Entries)..."
+$AppName = "Liongard"
+$DeepCleanFound = $false
+$HKCR_Products = "Registry::HKEY_CLASSES_ROOT\Installer\Products"
+$HKCR_Upgrade  = "Registry::HKEY_CLASSES_ROOT\Installer\UpgradeCodes"
+
+# A. Search Packed Installer Products (The primary source of Error 1612)
+if (Test-Path $HKCR_Products) {
+    Get-ChildItem -Path $HKCR_Products -ErrorAction SilentlyContinue | ForEach-Object {
+        $ProdName = (Get-ItemProperty -Path $_.PSPath -Name "ProductName" -ErrorAction SilentlyContinue).ProductName
+        if ($ProdName -like "*$AppName*") {
+            Write-Log "Found Ghost Key in HKCR\Products: $($_.PSPath) ($ProdName)" "WARN"
+            try {
+                Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction Stop
+                Write-Log "--- DELETED ---"
+                $DeepCleanFound = $true
+            } catch {
+                Write-Log "Failed to delete key: $_" "ERROR"
+            }
+        }
+    }
+}
+
+# B. Search Upgrade Codes (Prevents version mismatch)
+if (Test-Path $HKCR_Upgrade) {
+    Get-ChildItem -Path $HKCR_Upgrade -ErrorAction SilentlyContinue | ForEach-Object {
+        $Values = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+        # Check if any value inside matches Liongard
+        if ($Values.PSObject.Properties.Value -match $AppName) {
+             Write-Log "Found Ghost Key in HKCR\UpgradeCodes: $($_.PSPath)" "WARN"
+             try {
+                Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction Stop
+                Write-Log "--- DELETED ---"
+                $DeepCleanFound = $true
+             } catch {
+                Write-Log "Failed to delete key: $_" "ERROR"
+             }
+        }
+    }
+}
+
+if ($DeepCleanFound) { Write-Log "Deep Clean performed actions. Registry should now be clear for fresh install." }
+else { Write-Log "No hidden/corrupted keys found in Deep Clean sweep." }
+
+# Optional: Cleanup Program Files
+$ProgFiles = "$env:ProgramFiles\Liongard"
+if (Test-Path $ProgFiles) { Remove-Item $ProgFiles -Recurse -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 5
+
+# --- 7. Install New Agent ---
+Write-Log "Installing Fresh Liongard Agent..."
+$EnvArg = if (-not [string]::IsNullOrWhiteSpace($Environment)) { "LIONGARDENVIRONMENT=`"$Environment`"" } else { "" }
+$InstallLog = "$Folder\AgentInstall.log"
+$InstallArgs = "/i `"$MsiPath`" LIONGARDURL=$Url LIONGARDACCESSKEY=$AccessKey LIONGARDACCESSSECRET=$AccessSecret $EnvArg LIONGARDAGENTNAME=`"$env:computername`" /qn /norestart /L*V `"$InstallLog`""
+
+try {
+    $Process = Start-Process -FilePath "msiexec.exe" -ArgumentList $InstallArgs -Wait -PassThru -NoNewWindow
+    
+    if ($Process.ExitCode -ne 0 -and $Process.ExitCode -ne 3010) { 
+        $FailureReason = "Unknown MSI Error (Code $($Process.ExitCode))"
+        Start-Sleep -Seconds 2
+        
+        if (Test-Path $InstallLog) {
+            $LogContent = Get-Content $InstallLog
+            $Validation = $LogContent | Select-String -Pattern "INVALIDMSG = (.*)" | Select-Object -Last 1
+            $StandardErr = $LogContent | Select-String -Pattern "Product: .* -- Error \d+" | Select-Object -Last 1
+            $InternalErr = $LogContent | Select-String -Pattern "Note: 1: \d+ 2: (.*)" | Select-Object -Last 1
+            
+            if ($Validation) { $FailureReason = "INPUT ERROR: $($Validation.Matches.Groups[1].Value)" }
+            elseif ($StandardErr) { $FailureReason = "SYSTEM ERROR: $($StandardErr.Line)" }
+            elseif ($InternalErr) { $FailureReason = "INSTALLER ERROR: $($InternalErr.Matches.Groups[1].Value)" }
+        }
+        throw $FailureReason
+    }
+}
+catch { Write-Log "$_" "ERROR"; Exit-Smart 1 }
+
+# --- 8. Verification ---
+Write-Log "Verifying Service Startup (Max 120s)..."
+$Retry = 0; $Started = $false; $DetectedServiceName = $null
+do {
+    Start-Sleep -Seconds 5
+    $Service = Get-Service | Where-Object { $_.Name -like "*Liongard*" -or $_.DisplayName -like "*Liongard*" } | Select-Object -First 1
+    if ($Service -and $Service.Status -eq "Running") { $DetectedServiceName = $Service.Name; $Started = $true }
+    $Retry++
+} until ($Started -or $Retry -ge 24)
+
+if ($Started) { 
+    Write-Log "SUCCESS: Service '$DetectedServiceName' is Running." 
+    Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
+    Exit-Smart 0
+} else { 
+    Write-Log "WARNING: Service installed but not running." "WARN"
+    Exit-Smart 1
+}
