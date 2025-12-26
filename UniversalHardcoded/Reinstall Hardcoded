@@ -1,9 +1,11 @@
 <#
 .SYNOPSIS
-    Liongard Agent RE-INSTALLATION - Production Ready (v2.5)
+    Liongard Agent RE-INSTALLATION - Production Ready (v2.6)
 .DESCRIPTION
     - Actions: Downloads fresh MSI -> Removes Old Agent -> Deep Cleans Registry -> Installs New Agent.
-    - Deep Clean: Fixes Error 1612 by removing "ghost" entries in HKCR\Installer\Products.
+    - Deep Clean: 
+        1. Fixes Error 1612 by removing "ghost" entries in HKCR\Installer\Products.
+        2. Fixes Error 3:2 by removing stuck "Rollback" scripts in HKLM.
     - Configuration: Supports Hardcoded variables, Parameters, or Interactive Prompts.
 #>
 
@@ -72,7 +74,7 @@ function Get-RequiredInput {
     return $Val
 }
 
-Write-Log "--- Starting Liongard Agent RE-INSTALLATION (v2.5 - Deep Clean) ---"
+Write-Log "--- Starting Liongard Agent RE-INSTALLATION (v2.6 - Deep Clean) ---"
 
 # --- 4. Validation & Sanitization ---
 $Url          = Get-RequiredInput -CurrentValue $Url          -PromptName "1. Liongard URL"
@@ -132,12 +134,13 @@ if ($ExistingService) {
     }
 }
 
-# --- 6.5. Deep Clean Logic (Fix for Error 1612) ---
+# --- 6.5. Deep Clean Logic (Fix for Error 1612 & Error 3:2) ---
 Write-Log "Phase 2: Deep Registry Clean (Hunting for Ghost/Corrupted Entries)..."
 $AppName = "Liongard"
 $DeepCleanFound = $false
 $HKCR_Products = "Registry::HKEY_CLASSES_ROOT\Installer\Products"
 $HKCR_Upgrade  = "Registry::HKEY_CLASSES_ROOT\Installer\UpgradeCodes"
+$HKLM_Rollback = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Installer\Rollback"
 
 # A. Search Packed Installer Products (The primary source of Error 1612)
 if (Test-Path $HKCR_Products) {
@@ -170,6 +173,40 @@ if (Test-Path $HKCR_Upgrade) {
              } catch {
                 Write-Log "Failed to delete key: $_" "ERROR"
              }
+        }
+    }
+}
+
+# C. Search & Destroy Stuck Rollback Scripts (Fix for Error 3:2)
+if (Test-Path $HKLM_Rollback) {
+    Write-Log "Found Zombie Rollback Key: $HKLM_Rollback" "WARN"
+    try {
+        # Attempt 1: Standard Delete
+        Remove-Item -Path $HKLM_Rollback -Recurse -Force -ErrorAction Stop
+        Write-Log "--- DELETED (Standard) ---"
+        $DeepCleanFound = $true
+    } catch {
+        Write-Log "Standard delete failed ($($_.Exception.Message)). Attempting ACL Escalation..." "WARN"
+        try {
+            # Attempt 2: Take Ownership & Force Delete
+            $ACL = Get-Acl $HKLM_Rollback
+            $Admin = New-Object System.Security.Principal.NTAccount("Administrators")
+            
+            # Set Owner
+            $ACL.SetOwner($Admin)
+            Set-Acl -Path $HKLM_Rollback -AclObject $ACL
+
+            # Set Full Control
+            $Rule = New-Object System.Security.AccessControl.RegistryAccessRule($Admin,"FullControl","ContainerInherit,ObjectInherit","None","Allow")
+            $ACL.SetAccessRule($Rule)
+            Set-Acl -Path $HKLM_Rollback -AclObject $ACL
+
+            # Delete again
+            Remove-Item -Path $HKLM_Rollback -Recurse -Force -ErrorAction Stop
+            Write-Log "--- DELETED (Via ACL Force) ---"
+            $DeepCleanFound = $true
+        } catch {
+            Write-Log "CRITICAL: Unable to delete Rollback key even with ACL modification." "ERROR"
         }
     }
 }
