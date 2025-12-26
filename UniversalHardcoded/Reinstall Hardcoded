@@ -7,6 +7,7 @@
         1. Fixes Error 1612 by removing "ghost" entries in HKCR\Installer\Products.
         2. Fixes Error 3:2 by removing stuck "Rollback" scripts in HKLM.
     - Configuration: Supports Hardcoded variables, Parameters, or Interactive Prompts.
+    - Error Handling: Passes through specific MSI exit codes to the RMM.
 #>
 
 # --- 0. CONFIGURATION (HARDCODE VALUES HERE) ---
@@ -53,8 +54,13 @@ function Exit-Smart {
     Stop-Transcript -ErrorAction SilentlyContinue
     if ([Environment]::UserInteractive) {
         Write-Host "`n---------------------------------------------------"
-        if ($Code -ne 0) { Write-Host "SCRIPT FAILED (Exit Code $Code) - Check logs above." -ForegroundColor Red }
-        else { Write-Host "SCRIPT FINISHED SUCCESSFULLY" -ForegroundColor Green }
+        if ($Code -eq 0) { 
+            Write-Host "SCRIPT FINISHED SUCCESSFULLY" -ForegroundColor Green 
+        } elseif ($Code -eq 3010) {
+            Write-Host "SCRIPT FINISHED - REBOOT REQUIRED (Code 3010)" -ForegroundColor Yellow
+        } else { 
+            Write-Host "SCRIPT FAILED (Exit Code $Code) - Check logs above." -ForegroundColor Red 
+        }
         Write-Host "---------------------------------------------------"
         Read-Host "Press Enter to close this window..."
     }
@@ -219,19 +225,32 @@ $ProgFiles = "$env:ProgramFiles\Liongard"
 if (Test-Path $ProgFiles) { Remove-Item $ProgFiles -Recurse -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 5
 
-# --- 7. Install New Agent ---
+# --- 7. Install New Agent (With Error Passthrough) ---
 Write-Log "Installing Fresh Liongard Agent..."
 $EnvArg = if (-not [string]::IsNullOrWhiteSpace($Environment)) { "LIONGARDENVIRONMENT=`"$Environment`"" } else { "" }
 $InstallLog = "$Folder\AgentInstall.log"
 $InstallArgs = "/i `"$MsiPath`" LIONGARDURL=$Url LIONGARDACCESSKEY=$AccessKey LIONGARDACCESSSECRET=$AccessSecret $EnvArg LIONGARDAGENTNAME=`"$env:computername`" /qn /norestart /L*V `"$InstallLog`""
 
+# Initialize generic failure code (1) in case script crashes before MSI runs
+$MsiExitCode = 1 
+
 try {
     $Process = Start-Process -FilePath "msiexec.exe" -ArgumentList $InstallArgs -Wait -PassThru -NoNewWindow
+    $MsiExitCode = $Process.ExitCode
     
-    if ($Process.ExitCode -ne 0 -and $Process.ExitCode -ne 3010) { 
-        $FailureReason = "Unknown MSI Error (Code $($Process.ExitCode))"
+    # CASE 1: Reboot Required (3010)
+    if ($MsiExitCode -eq 3010) {
+        Write-Log "SUCCESS: Agent installed, but system reboot is required (Code 3010)." "WARN"
+        Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
+        Exit-Smart 3010
+    }
+
+    # CASE 2: Hard Failure (Non-Zero)
+    if ($MsiExitCode -ne 0) { 
+        $FailureReason = "Unknown MSI Error (Code $MsiExitCode)"
         Start-Sleep -Seconds 2
         
+        # Parse the MSI Log for human-readable context
         if (Test-Path $InstallLog) {
             $LogContent = Get-Content $InstallLog
             $Validation = $LogContent | Select-String -Pattern "INVALIDMSG = (.*)" | Select-Object -Last 1
@@ -242,10 +261,15 @@ try {
             elseif ($StandardErr) { $FailureReason = "SYSTEM ERROR: $($StandardErr.Line)" }
             elseif ($InternalErr) { $FailureReason = "INSTALLER ERROR: $($InternalErr.Matches.Groups[1].Value)" }
         }
+        # Throw error to trigger catch block, but preserve the ID
         throw $FailureReason
     }
 }
-catch { Write-Log "$_" "ERROR"; Exit-Smart 1 }
+catch { 
+    Write-Log "$_" "ERROR"
+    # Exit with the ACTUAL MSI code (e.g., 1603, 1618) instead of generic 1
+    Exit-Smart $MsiExitCode 
+}
 
 # --- 8. Verification ---
 Write-Log "Verifying Service Startup (Max 120s)..."
