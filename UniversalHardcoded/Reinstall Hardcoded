@@ -1,15 +1,14 @@
 <#
 .SYNOPSIS
-    Liongard Agent RE-INSTALLATION (v2.9.1)
+    Liongard Agent RE-INSTALLATION (v2.9.2)
 .DESCRIPTION
-    - Actions: Downloads fresh MSI -> Removes Old Agent -> Deep Cleans Registry -> Installs New Agent.
-    - Network Resilience: Retries failed downloads (fixes SSL/TLS dropped connections).
-    - Process Hygiene: Kills stuck MSIExec processes before starting.
-    - Error Engine: Translates 1603, 1612, 1618, 1638, 1920, and Access Denied into English.
+    - RMM Translation: Outputs "FAILURE_REASON: [English Error]" to RMM StdOut.
+    - Deep Clean: Removes "ghost" registry keys (Error 1612) and stuck Rollback scripts.
+    - Network Resilience: Retries failed downloads.
+    - Process Hygiene: Kills stuck MSIExec processes.
 #>
 
 # --- 1. PARAMETERS (MUST BE FIRST) ---
-# These accept values passed from your RMM (e.g. -Url "xyz.app.liongard.com")
 param(
     [string]$Url,
     [string]$AccessKey,
@@ -18,7 +17,6 @@ param(
 )
 
 # --- 2. CONFIGURATION (HARDCODE OVERRIDES) ---
-# If you enter values here, they will OVERRIDE the parameters above.
 $Hardcoded_Url          = ""   # e.g. "instance.app.liongard.com"
 $Hardcoded_AccessKey    = ""   # e.g. "BnKs..."
 $Hardcoded_AccessSecret = ""   # e.g. "89s7..."
@@ -71,19 +69,20 @@ function Exit-Smart {
     Stop-Transcript -ErrorAction SilentlyContinue
     if ([Environment]::UserInteractive) {
         Write-Host "`n---------------------------------------------------"
-        if ($Code -ne 0) { Write-Host "SCRIPT FAILED (Exit Code $Code) - Check logs above." -ForegroundColor Red }
+        if ($Code -ne 0) { Write-Host "SCRIPT FAILED (Exit Code $Code)" -ForegroundColor Red }
         else { Write-Host "SCRIPT FINISHED SUCCESSFULLY" -ForegroundColor Green }
         Write-Host "---------------------------------------------------"
-        Read-Host "Press Enter to close this window..."
+        Read-Host "Press Enter to close..."
     }
     Exit $Code
 }
 
-Write-Log "--- Starting Liongard Agent RE-INSTALLATION (Omniscient v2.9.1) ---"
+Write-Log "--- Starting Liongard Agent RE-INSTALLATION (v2.9.2) ---"
 
 # --- 6. Validation ---
 if ([string]::IsNullOrWhiteSpace($Url) -or [string]::IsNullOrWhiteSpace($AccessKey) -or [string]::IsNullOrWhiteSpace($AccessSecret) -or $Url -match "YOUR_") {
-    Write-Log "FATAL ERROR: Credentials missing. Provide Parameters OR edit the Configuration section." "ERROR"
+    Write-Output "FAILURE_REASON: Missing Credentials. Provide Parameters OR edit the Configuration section."
+    Write-Log "FATAL ERROR: Credentials missing." "ERROR"
     Exit-Smart 1
 }
 
@@ -95,13 +94,13 @@ $MinFreeSpaceMB  = 200
 # Enforce Strong Crypto (TLS 1.2 / 1.3)
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
 
-# --- 7. Pre-Flight Hygiene (Process Killing) ---
+# --- 7. Pre-Flight Hygiene ---
 Write-Log "Performing Pre-Flight Hygiene..."
 
-# Kill stuck MSI processes (Fixes Error 1618)
+# Kill stuck MSI processes
 $StuckMsi = Get-Process -Name "msiexec" -ErrorAction SilentlyContinue
 if ($StuckMsi) {
-    Write-Log "Found stuck msiexec process(es). Terminating..." "WARN"
+    Write-Log "Killing stuck msiexec processes..." "WARN"
     Stop-Process -Name "msiexec" -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 3
 }
@@ -110,32 +109,31 @@ try {
     $Disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" | Select-Object FreeSpace
     if (([math]::Round($Disk.FreeSpace / 1MB)) -lt $MinFreeSpaceMB) { throw "Insufficient disk space." }
 }
-catch { Write-Log "Pre-check failed: $_" "ERROR"; Exit-Smart 1 }
+catch { 
+    Write-Output "FAILURE_REASON: Pre-Check Failed - $_"
+    Write-Log "Pre-check failed: $_" "ERROR"
+    Exit-Smart 1 
+}
 
 # --- 8. Download with Retry Logic ---
 Write-Log "Downloading MSI..."
-$DownloadSuccess = $false
-$Attempts = 0
-$MaxAttempts = 3
-
+$DownloadSuccess = $false; $Attempts = 0
 do {
     $Attempts++
     try {
-        Write-Log "Attempt $Attempts of $MaxAttempts..."
+        Write-Log "Attempt $Attempts of 3..."
         Invoke-WebRequest -Uri $DownloadUri -OutFile $MsiPath -UseBasicParsing -ErrorAction Stop
         if ((Get-Item $MsiPath).Length -ge $MinMsiSize) { 
             $DownloadSuccess = $true 
             Write-Log "Download Complete."
         } else { throw "File too small (Corrupt)." }
     }
-    catch {
-        Write-Log "Download failed ($($_)): $_" "WARN"
-        Start-Sleep -Seconds 5 
-    }
-} until ($DownloadSuccess -or $Attempts -ge $MaxAttempts)
+    catch { Write-Log "Download failed: $_" "WARN"; Start-Sleep -Seconds 5 }
+} until ($DownloadSuccess -or $Attempts -ge 3)
 
 if (-not $DownloadSuccess) {
-    Write-Log "FATAL ERROR: Failed to download MSI after $MaxAttempts attempts." "ERROR"
+    Write-Output "FAILURE_REASON: Failed to download MSI after 3 attempts."
+    Write-Log "FATAL ERROR: Download failed." "ERROR"
     Exit-Smart 1
 }
 
@@ -190,8 +188,8 @@ if (Test-Path $HKLM_Rollback) {
     $DeepCleanFound = $true
 }
 
-if ($DeepCleanFound) { Write-Log "Deep Clean performed actions. Registry should now be clear for fresh install." }
-else { Write-Log "No hidden/corrupted keys found in Deep Clean sweep." }
+if ($DeepCleanFound) { Write-Log "Deep Clean performed actions." }
+else { Write-Log "No hidden/corrupted keys found." }
 
 # Optional: Cleanup Program Files
 $ProgFiles = "$env:ProgramFiles\Liongard"
@@ -204,7 +202,7 @@ $EnvArg = if (-not [string]::IsNullOrWhiteSpace($Environment)) { "LIONGARDENVIRO
 $InstallLog = "$Folder\AgentInstall.log"
 $InstallArgs = "/i `"$MsiPath`" LIONGARDURL=$Url LIONGARDACCESSKEY=$AccessKey LIONGARDACCESSSECRET=$AccessSecret $EnvArg LIONGARDAGENTNAME=`"$env:computername`" /qn /norestart /L*V `"$InstallLog`""
 
-# Initialize generic failure code to prevent null reference in Catch block
+# Initialize generic failure code to prevent null reference issues
 $MsiExitCode = 1 
 
 try {
@@ -219,75 +217,37 @@ try {
             $LogContent = Get-Content $InstallLog
             
             # --- INTELLIGENT ERROR PARSING ENGINE ---
-            $SecurityBlock = $LogContent | Select-String -Pattern "Error code 0x80070005"
-            $ServiceFail   = $LogContent | Select-String -Pattern "Error 1920"
-            $PrivilegeErr  = $LogContent | Select-String -Pattern "Privileged rights are required"
-            $Validation    = $LogContent | Select-String -Pattern "INVALIDMSG = (.*)" | Select-Object -Last 1
-            $StandardErr   = $LogContent | Select-String -Pattern "Product: .* -- Error \d+" | Select-Object -Last 1
-            
-            # 1. SECURITY / THREATLOCKER (0x80070005)
-            if ($SecurityBlock) { 
-                Write-Log "***************************************************************" "ERROR"
-                Write-Log "CRITICAL ERROR: SECURITY SOFTWARE BLOCK DETECTED" "ERROR"
-                Write-Log "TYPE: Access Denied (0x80070005) on Temp Files" "ERROR"
-                Write-Log "CAUSE: ThreatLocker, SentinelOne, or AppLocker is preventing the MSI from extracting files." "ERROR"
-                Write-Log "ACTION: Whitelist 'Liongard Inc.' certificate or enable Installation Mode." "ERROR"
-                Write-Log "***************************************************************" "ERROR"
-                $FailureReason = "Security Software Blocked Installation."
+            if ($LogContent | Select-String "Error code 0x80070005") {
+                $FailureReason = "SECURITY BLOCK (0x80070005): ThreatLocker/S1 blocked temp file execution. Whitelist 'Liongard Inc'."
             }
-            # 2. SERVICE START FAILURE (1920)
-            elseif ($ServiceFail) {
-                Write-Log "***************************************************************" "ERROR"
-                Write-Log "CRITICAL ERROR: SERVICE FAILED TO START (Error 1920)" "ERROR"
-                Write-Log "CAUSE: The Agent installed, but the Service refused to start." "ERROR"
-                Write-Log "LIKELY CULPRITS: 1) AV quarantined the EXE. 2) Missing .NET Framework." "ERROR"
-                Write-Log "ACTION: Check AV logs for 'LiongardAgent.exe'." "ERROR"
-                Write-Log "***************************************************************" "ERROR"
-                $FailureReason = "Service failed to start during install (1920)."
+            elseif ($LogContent | Select-String "Error 1920") {
+                $FailureReason = "SERVICE FAILURE (1920): Agent installed but service failed to start. Check AV Quarantine."
             }
-            # 3. VERSION CONFLICT (1638)
             elseif ($MsiExitCode -eq 1638) {
-                Write-Log "***************************************************************" "ERROR"
-                Write-Log "CRITICAL ERROR: NEWER VERSION DETECTED (Error 1638)" "ERROR"
-                Write-Log "CAUSE: A newer (or same) version of the Agent is already installed." "ERROR"
-                Write-Log "ACTION: Uninstall the existing agent manually before running this." "ERROR"
-                Write-Log "***************************************************************" "ERROR"
-                $FailureReason = "Newer version already installed (1638)."
+                $FailureReason = "VERSION CONFLICT (1638): A newer version is already installed."
             }
-            # 4. INSTALLER BUSY (1618)
             elseif ($MsiExitCode -eq 1618) {
-                Write-Log "***************************************************************" "ERROR"
-                Write-Log "CRITICAL ERROR: WINDOWS INSTALLER IS BUSY (Error 1618)" "ERROR"
-                Write-Log "CAUSE: Another installation (Windows Update/RMM) is running." "ERROR"
-                Write-Log "ACTION: Wait 15 minutes and try again." "ERROR"
-                Write-Log "***************************************************************" "ERROR"
-                $FailureReason = "Windows Installer service is busy (1618)."
+                $FailureReason = "INSTALLER BUSY (1618): Another installation is running. Wait 15 mins."
             }
-            # 5. REGISTRY CORRUPTION (1612)
             elseif ($MsiExitCode -eq 1612) {
-                Write-Log "***************************************************************" "ERROR"
-                Write-Log "CRITICAL ERROR: REGISTRY CORRUPTION (Error 1612)" "ERROR"
-                Write-Log "ACTION: Run the 'Liongard Deep Clean' script to purge HKCR\Installer\Products." "ERROR"
-                Write-Log "***************************************************************" "ERROR"
-                $FailureReason = "Registry Corruption (1612) - Deep Clean required."
+                $FailureReason = "REGISTRY CORRUPTION (1612): Deep Clean failed. Manual registry repair required."
             }
-            # 6. USER CANCELLED (1602)
-            elseif ($MsiExitCode -eq 1602) {
-                $FailureReason = "Installation cancelled by user."
-            }
-            # 7. INPUT ERROR
-            elseif ($Validation) { 
-                $FailureReason = "INPUT ERROR: $($Validation.Matches.Groups[1].Value)" 
-            }
-            # 8. GENERIC SYSTEM ERROR
-            elseif ($StandardErr) { 
-                $FailureReason = "SYSTEM ERROR: $($StandardErr.Line)" 
+            elseif ($Match = ($LogContent | Select-String "INVALIDMSG = (.*)" | Select-Object -Last 1)) {
+                 $FailureReason = "INPUT ERROR: $($Match.Matches.Groups[1].Value)"
             }
         }
         throw $FailureReason
     }
 }
-catch { Write-Log "$_" "ERROR"; Exit-Smart $MsiExitCode }
+catch { 
+    $TranslatedError = $_.Exception.Message
+    Write-Log "$TranslatedError" "ERROR"
+    
+    # OUTPUT TO RMM DASHBOARD
+    Write-Output "FAILURE_REASON: $TranslatedError"
+    
+    Exit-Smart $MsiExitCode 
+}
 
 # --- 12. Verification ---
 Write-Log "Verifying Service Startup (Max 120s)..."
@@ -304,6 +264,7 @@ if ($Started) {
     Remove-Item $MsiPath -Force -ErrorAction SilentlyContinue
     Exit-Smart 0
 } else { 
+    Write-Output "FAILURE_REASON: Installation appeared successful, but Service is NOT running."
     Write-Log "WARNING: Service installed but not running." "WARN"
     Exit-Smart 1
 }
