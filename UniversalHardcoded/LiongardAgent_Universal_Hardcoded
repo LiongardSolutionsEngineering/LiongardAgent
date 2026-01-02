@@ -1,26 +1,40 @@
 <#
 .SYNOPSIS
-    Liongard Agent Installation (v2.9)
+    Liongard Agent RE-INSTALLATION (v2.9.1)
 .DESCRIPTION
+    - Actions: Downloads fresh MSI -> Removes Old Agent -> Deep Cleans Registry -> Installs New Agent.
     - Network Resilience: Retries failed downloads (fixes SSL/TLS dropped connections).
     - Process Hygiene: Kills stuck MSIExec processes before starting.
     - Error Engine: Translates 1603, 1612, 1618, 1638, 1920, and Access Denied into English.
 #>
 
-# =======================================================
-# --- CONFIGURATION (EDIT THIS SECTION) ---
-# =======================================================
+# --- 1. PARAMETERS (MUST BE FIRST) ---
+# These accept values passed from your RMM (e.g. -Url "xyz.app.liongard.com")
+param(
+    [string]$Url,
+    [string]$AccessKey,
+    [string]$AccessSecret,
+    [string]$Environment
+)
 
-[string]$Url          = "YOUR_LIONGARD_URL"        # e.g. "us1.app.liongard.com"
-[string]$AccessKey    = "YOUR_ACCESS_KEY"          # e.g. "AKID12345..."
-[string]$AccessSecret = "YOUR_ACCESS_SECRET"       # e.g. "SECRET12345..."
-[string]$Environment  = "YOUR_ENV_NAME"            # Optional. Can use "Name" or "Name%20Here"
+# --- 2. CONFIGURATION (HARDCODE OVERRIDES) ---
+# If you enter values here, they will OVERRIDE the parameters above.
+$Hardcoded_Url          = ""   # e.g. "instance.app.liongard.com"
+$Hardcoded_AccessKey    = ""   # e.g. "BnKs..."
+$Hardcoded_AccessSecret = ""   # e.g. "89s7..."
+$Hardcoded_Environment  = ""   # Optional
 
 # =======================================================
 # --- SCRIPT LOGIC (DO NOT EDIT BELOW) ---
 # =======================================================
 
-# --- 1. Sanitization & Smart Decoding ---
+# --- 3. Logic: Prioritize Hardcoded -> Param ---
+if (-not [string]::IsNullOrWhiteSpace($Hardcoded_Url))          { $Url = $Hardcoded_Url }
+if (-not [string]::IsNullOrWhiteSpace($Hardcoded_AccessKey))    { $AccessKey = $Hardcoded_AccessKey }
+if (-not [string]::IsNullOrWhiteSpace($Hardcoded_AccessSecret)) { $AccessSecret = $Hardcoded_AccessSecret }
+if (-not [string]::IsNullOrWhiteSpace($Hardcoded_Environment))  { $Environment = $Hardcoded_Environment }
+
+# --- 4. Sanitization & Smart Decoding ---
 if ($Url -match "https://") { $Url = $Url -replace "https://","" -replace "/","" }
 if ($Url -notmatch "\.app\.liongard\.com") { $Url = "$Url.app.liongard.com"; Write-Host "Auto-corrected URL to: $Url" }
 
@@ -35,10 +49,10 @@ if (-not [string]::IsNullOrWhiteSpace($Environment)) {
     } catch {}
 }
 
-# --- 2. Setup & Logging ---
+# --- 5. Setup & Logging ---
 $Folder          = "$env:ProgramData\Liongard"
-$LogFile         = "$Folder\ScriptInstall.log"
-$TranscriptPath  = "$Folder\TranscriptLog.txt"
+$LogFile         = "$Folder\ScriptReinstall.log"
+$TranscriptPath  = "$Folder\TranscriptReinstall.txt"
 
 if (-not (Test-Path -Path $Folder)) { New-Item -Path $Folder -ItemType Directory -ErrorAction SilentlyContinue | Out-Null }
 try { Start-Transcript -Path $TranscriptPath -Append -Force -ErrorAction Stop } 
@@ -65,11 +79,11 @@ function Exit-Smart {
     Exit $Code
 }
 
-Write-Log "--- Starting Liongard Agent Installation (Omniscient v2.9) ---"
+Write-Log "--- Starting Liongard Agent RE-INSTALLATION (Omniscient v2.9.1) ---"
 
-# --- 3. Validation ---
+# --- 6. Validation ---
 if ([string]::IsNullOrWhiteSpace($Url) -or [string]::IsNullOrWhiteSpace($AccessKey) -or [string]::IsNullOrWhiteSpace($AccessSecret) -or $Url -match "YOUR_") {
-    Write-Log "FATAL ERROR: You must edit the CONFIGURATION section at the top of this script with real credentials." "ERROR"
+    Write-Log "FATAL ERROR: Credentials missing. Provide Parameters OR edit the Configuration section." "ERROR"
     Exit-Smart 1
 }
 
@@ -78,23 +92,18 @@ $DownloadUri     = "https://agents.static.liongard.com/LiongardAgent-lts.msi"
 $MinMsiSize      = 10485760 
 $MinFreeSpaceMB  = 200
 
-# Enforce Strong Crypto
+# Enforce Strong Crypto (TLS 1.2 / 1.3)
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls13
 
-# --- 4. Pre-Flight Checks & Hygiene ---
+# --- 7. Pre-Flight Hygiene (Process Killing) ---
 Write-Log "Performing Pre-Flight Hygiene..."
 
-# Kill stuck MSI processes
+# Kill stuck MSI processes (Fixes Error 1618)
 $StuckMsi = Get-Process -Name "msiexec" -ErrorAction SilentlyContinue
 if ($StuckMsi) {
     Write-Log "Found stuck msiexec process(es). Terminating..." "WARN"
     Stop-Process -Name "msiexec" -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 3
-}
-
-if (Get-Service | Where-Object { $_.Name -like "*Liongard*" -or $_.DisplayName -like "*Liongard*" }) {
-    Write-Log "A Liongard Agent service is already present. Aborting." "WARN"
-    Exit-Smart 0
 }
 
 try {
@@ -103,7 +112,7 @@ try {
 }
 catch { Write-Log "Pre-check failed: $_" "ERROR"; Exit-Smart 1 }
 
-# --- 5. Download with Retry Logic ---
+# --- 8. Download with Retry Logic ---
 Write-Log "Downloading MSI..."
 $DownloadSuccess = $false
 $Attempts = 0
@@ -130,18 +139,80 @@ if (-not $DownloadSuccess) {
     Exit-Smart 1
 }
 
-# --- 6. Install Logic ---
-Write-Log "Installing Liongard Agent..."
+# --- 9. Detection & Removal Logic (Standard) ---
+Write-Log "Phase 1: Standard Removal Checks..."
+$ExistingService = Get-Service | Where-Object { $_.Name -like "*Liongard*" -or $_.DisplayName -like "*Liongard*" }
+
+if ($ExistingService) {
+    Write-Log "Existing Agent Found: $($ExistingService.Name)."
+    if ($ExistingService.Status -eq 'Running') {
+        Stop-Service $ExistingService.Name -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 5
+    }
+
+    $UninstallKey = Get-ChildItem -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall, HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall -ErrorAction SilentlyContinue |
+        Get-ItemProperty | Where-Object { $_.DisplayName -like "*Liongard Agent*" } | Select-Object -First 1
+
+    if ($UninstallKey) {
+        $UninstallString = $UninstallKey.UninstallString
+        if ($UninstallString -match "MsiExec.exe") {
+            $ProductCode = ($UninstallKey.UninstallString -replace "MsiExec.exe", "" -replace "/I", "" -replace "/X", "").Trim()
+            Write-Log "Uninstalling Standard Product Code: $ProductCode"
+            Start-Process "msiexec.exe" -ArgumentList "/x $ProductCode /qn /norestart" -Wait
+        }
+    }
+}
+
+# --- 10. Deep Clean Logic (Fix for Error 1612 & Error 3:2) ---
+Write-Log "Phase 2: Deep Registry Clean (Hunting for Ghost/Corrupted Entries)..."
+$AppName = "Liongard"
+$DeepCleanFound = $false
+# Use Registry:: provider to ensure consistency across 32/64-bit PS sessions
+$HKCR_Products = "Registry::HKEY_CLASSES_ROOT\Installer\Products"
+$HKLM_Rollback = "Registry::HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Installer\Rollback"
+
+# A. Search Packed Installer Products (Error 1612)
+if (Test-Path $HKCR_Products) {
+    Get-ChildItem -Path $HKCR_Products -ErrorAction SilentlyContinue | ForEach-Object {
+        $ProdName = (Get-ItemProperty -Path $_.PSPath -Name "ProductName" -ErrorAction SilentlyContinue).ProductName
+        if ($ProdName -like "*$AppName*") {
+            Write-Log "Found Ghost Key in HKCR\Products: $($_.PSPath)" "WARN"
+            Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+            $DeepCleanFound = $true
+        }
+    }
+}
+
+# B. Search & Destroy Stuck Rollback Scripts (Error 3:2)
+if (Test-Path $HKLM_Rollback) {
+    Write-Log "Found Zombie Rollback Key: $HKLM_Rollback" "WARN"
+    Remove-Item -Path $HKLM_Rollback -Recurse -Force -ErrorAction SilentlyContinue
+    $DeepCleanFound = $true
+}
+
+if ($DeepCleanFound) { Write-Log "Deep Clean performed actions. Registry should now be clear for fresh install." }
+else { Write-Log "No hidden/corrupted keys found in Deep Clean sweep." }
+
+# Optional: Cleanup Program Files
+$ProgFiles = "$env:ProgramFiles\Liongard"
+if (Test-Path $ProgFiles) { Remove-Item $ProgFiles -Recurse -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 5
+
+# --- 11. Install Logic ---
+Write-Log "Installing Fresh Liongard Agent..."
 $EnvArg = if (-not [string]::IsNullOrWhiteSpace($Environment)) { "LIONGARDENVIRONMENT=`"$Environment`"" } else { "" }
 $InstallLog = "$Folder\AgentInstall.log"
 $InstallArgs = "/i `"$MsiPath`" LIONGARDURL=$Url LIONGARDACCESSKEY=$AccessKey LIONGARDACCESSSECRET=$AccessSecret $EnvArg LIONGARDAGENTNAME=`"$env:computername`" /qn /norestart /L*V `"$InstallLog`""
 
+# Initialize generic failure code to prevent null reference in Catch block
+$MsiExitCode = 1 
+
 try {
     $Process = Start-Process -FilePath "msiexec.exe" -ArgumentList $InstallArgs -Wait -PassThru -NoNewWindow
+    $MsiExitCode = $Process.ExitCode
     
-    if ($Process.ExitCode -ne 0 -and $Process.ExitCode -ne 3010) { 
-        $ExitCode = $Process.ExitCode
-        $FailureReason = "Unknown MSI Error (Code $ExitCode)"
+    if ($MsiExitCode -ne 0 -and $MsiExitCode -ne 3010) { 
+        $FailureReason = "Unknown MSI Error (Code $MsiExitCode)"
         Start-Sleep -Seconds 2 # Wait for log flush
         
         if (Test-Path $InstallLog) {
@@ -175,7 +246,7 @@ try {
                 $FailureReason = "Service failed to start during install (1920)."
             }
             # 3. VERSION CONFLICT (1638)
-            elseif ($ExitCode -eq 1638) {
+            elseif ($MsiExitCode -eq 1638) {
                 Write-Log "***************************************************************" "ERROR"
                 Write-Log "CRITICAL ERROR: NEWER VERSION DETECTED (Error 1638)" "ERROR"
                 Write-Log "CAUSE: A newer (or same) version of the Agent is already installed." "ERROR"
@@ -184,7 +255,7 @@ try {
                 $FailureReason = "Newer version already installed (1638)."
             }
             # 4. INSTALLER BUSY (1618)
-            elseif ($ExitCode -eq 1618) {
+            elseif ($MsiExitCode -eq 1618) {
                 Write-Log "***************************************************************" "ERROR"
                 Write-Log "CRITICAL ERROR: WINDOWS INSTALLER IS BUSY (Error 1618)" "ERROR"
                 Write-Log "CAUSE: Another installation (Windows Update/RMM) is running." "ERROR"
@@ -193,7 +264,7 @@ try {
                 $FailureReason = "Windows Installer service is busy (1618)."
             }
             # 5. REGISTRY CORRUPTION (1612)
-            elseif ($ExitCode -eq 1612) {
+            elseif ($MsiExitCode -eq 1612) {
                 Write-Log "***************************************************************" "ERROR"
                 Write-Log "CRITICAL ERROR: REGISTRY CORRUPTION (Error 1612)" "ERROR"
                 Write-Log "ACTION: Run the 'Liongard Deep Clean' script to purge HKCR\Installer\Products." "ERROR"
@@ -201,7 +272,7 @@ try {
                 $FailureReason = "Registry Corruption (1612) - Deep Clean required."
             }
             # 6. USER CANCELLED (1602)
-            elseif ($ExitCode -eq 1602) {
+            elseif ($MsiExitCode -eq 1602) {
                 $FailureReason = "Installation cancelled by user."
             }
             # 7. INPUT ERROR
@@ -216,9 +287,9 @@ try {
         throw $FailureReason
     }
 }
-catch { Write-Log "$_" "ERROR"; Exit-Smart 1 }
+catch { Write-Log "$_" "ERROR"; Exit-Smart $MsiExitCode }
 
-# --- 7. Verification ---
+# --- 12. Verification ---
 Write-Log "Verifying Service Startup (Max 120s)..."
 $Retry = 0; $Started = $false; $DetectedServiceName = $null
 do {
