@@ -1,119 +1,169 @@
 Liongard Agent Deployment - Universal Edition
 
 📖 Overview
-This script is the Universal solution for deploying the Liongard Agent. It is engineered to be RMM-agnostic, meaning it works flawlessly in ConnectWise Automate, Datto RMM, Kaseya VSA, N-able, Syncro, or even via Group Policy/PDQ Deploy.
-Context: Why use this version?
-Unlike "RMM-Specific" scripts that rely on dynamic variables (e.g., $env:liongardurl) injected by the RMM tool, this script is standalone. You edit the credentials directly inside the file.
-Best for: RMMs with complex variable handling, GPO deployments, or "one-off" installs.
-Trade-off: Because credentials are hardcoded, you must create a separate copy of this script file for each Liongard environment you deploy to.
+
+This script is the **Universal** solution for deploying the Liongard Agent. It is engineered to be **RMM-agnostic**, working flawlessly in ConnectWise Automate, Datto RMM, Kaseya VSA, NinjaOne, N-able, Syncro, or via Group Policy/PDQ Deploy.
+
+**Context: Why use this version?**
+Unlike "RMM-Specific" scripts that rely strictly on dynamic variables injected by the tool, this script is **flexible**. It prioritizes RMM parameters if available but falls back to **hardcoded credentials** inside the file if they are missing. This makes it the "Swiss Army Knife" of deployment scripts.
+
+* **Best for:** Mixed environments, GPO deployments, "one-off" installs, or RMMs with complex variable handling.
+* **Trade-off:** If you choose to hardcode credentials, you must create a separate copy of this script file for each Liongard environment you deploy to.
 
 Key Features
-Zero Dependencies: No external parameters or RMM variables required.
-Smart URL Handling: Automatically sanitizes inputs (strips https://, adds .app.liongard.com).
-Robust Environment Support: Handles complex names with spaces or special characters via "Smart Decoding."
-Deep Error Analysis: Parses MSI installer logs to translate generic error codes (like 1603) into human-readable issues.
+
+* **Error Handling:** Parses MSI logs and translates generic error codes (1603, 1618, 1920) and **Security Blocks** (0x80070005) into plain English for your RMM dashboard.
+* **Deep Clean Logic:** The Uninstaller Automatically hunts for and removes "ghost" registry keys (fixing Error 1612) and stuck "Rollback" scripts before installing.
+* **Process Hygiene:** Proactively kills stuck `msiexec` processes to prevent "Installer Busy" failures.
+* **Network Resilience:** Automatically retries downloads (3x) and enforces TLS 1.2/1.3 to bypass common SSL errors.
+* **Zero Dependencies:** Smart URL handling and environment decoding mean it just works.
+
+---
 
 ⚠️ Security & File Management (Read First)
-CRITICAL: Because this script contains hardcoded Access Key Secrets, it must be treated as a sensitive credential file.
+
+**CRITICAL:** If you use the **Hardcoded Configuration** section, this script contains your Access Key Secrets. It must be treated as a sensitive credential file.
+
 🛡️ Best Practices for IT Admins
-Naming Convention: When saving this file for a specific client, use a clear naming convention to avoid mixing up credentials.
-Bad: LiongardInstall.ps1
-Good: Liongard_Install_AcmeCorp_Hardcoded.ps1
 
-Storage Location:
-Do not store these customized scripts in a public folder or open network share (unless locked down for GPO).
-Do not upload the edited script to a public GitHub repository.
+1. **Naming Convention:** Use a clear naming convention to avoid mixing up credentials.
+* *Bad:* `LiongardInstall.ps1`
+* *Good:* `Liongard_Install_AcmeCorp_Hardcoded.ps1`
 
-Cleanup: If running manually on an endpoint (e.g., via USB), Shift+Delete the script immediately after execution.
+
+2. **Storage Location:**
+* **Do not** store these scripts in a public folder or open network share (unless locked down for GPO).
+* **Do not** upload the edited script to a public GitHub repository.
+
+
+3. **Cleanup:** If running manually on an endpoint (e.g., via USB), **Shift+Delete** the script immediately after execution.
+
+---
 
 ⚙️ Configuration Guide
-Before deploying, you must edit the Configuration Section at the very top of the script (Lines 10-15).
-Open Install-Liongard-Universal.ps1 in a text editor (VS Code, Notepad++, or your RMM Script Editor).
-Replace the placeholder text with your actual Liongard instance data.
 
+You have two ways to configure this script.
+
+Method 1: RMM Parameters (Recommended)
+
+Pass the credentials as arguments from your RMM script engine. The script accepts:
+`-Url`, `-AccessKey`, `-AccessSecret`, `-Environment`
+
+Method 2: Hardcoded (Standalone)
+
+Edit the **Configuration Section** at the very top of the script (Lines 10-15).
+
+1. Open `Install-Liongard-Universal.ps1` in a text editor (VS Code, Notepad++, or your RMM Script Editor).
+2. Replace the placeholder text with your actual Liongard instance data.
+
+```powershell
 # =======================================================
-# --- CONFIGURATION (EDIT THIS SECTION IN THE ACTUAL SCRIPT) ---
+# --- CONFIGURATION (HARDCODE VALUES HERE) ---
 # =======================================================
+$Hardcoded_Url          = "us1"                     # Subdomain is fine (e.g., "us1")
+$Hardcoded_AccessKey    = "AKID1234567890"          # Your Liongard Access Key ID
+$Hardcoded_AccessSecret = "SECRET1234567890ABCDEF"  # Your Liongard Access Key Secret
+$Hardcoded_Environment  = "Managed Services"        # (Optional) The Environment Name
 
-
-[string]$Url          = "us1"                       # Subdomain is fine (e.g., "us1")
-[string]$AccessKey    = "AKID1234567890"            # Your Liongard Access Key ID
-[string]$AccessSecret = "SECRET1234567890ABCDEF"    # Your Liongard Access Key Secret
-[string]$Environment  = "Managed Services"          # (Optional) The Environment Name
-
+```
 
 💡 Advanced Environment Naming
-Liongard Environment names often contain spaces, ampersands (&), or commas. Passing these via command line can sometimes cause syntax errors depending on how your RMM parses arguments.
-To ensure 100% reliability, this script supports URL Encoded strings.
-Tools
-Recommended Tool: Encode and Decode - Online
-Use this site to convert complex names into "safe" strings.
 
+Liongard Environment names often contain spaces, ampersands (`&`), or commas. Passing these via command line can sometimes cause syntax errors.
+To ensure 100% reliability, this script supports **URL Encoded** strings.
 
-How it works
-You can enter the name in the script in either format. The script's "Smart Decoder" handles both automatically.
-Your Environment NameConfiguration Input ($Environment)StatusStandard (Finance Dept)$Environment = "Finance Dept"✅ WorksEncoded (Finance%20Dept)$Environment = "Finance%20Dept"✅ Works (Safest for RMMs)Complex (Law & Order, LLC)$Environment = "Law%20%26%20Order%2C%20LLC"✅ Works (Prevents syntax errors)
+**Recommended Tool:** [Encode and Decode - Online](https://www.urlencoder.org/)
+
+| Your Environment Name | Configuration Input (`$Environment`) | Status |
+| --- | --- | --- |
+| **Standard** (Finance Dept) | `$Environment = "Finance Dept"` | ✅ Works |
+| **Encoded** (Finance%20Dept) | `$Environment = "Finance%20Dept"` | ✅ Works (Safest for RMMs) |
+| **Complex** (Law & Order, LLC) | `$Environment = "Law%20%26%20Order%2C%20LLC"` | ✅ Works (Prevents syntax errors) |
+
+---
+
 🚀 Deployment Scenarios
+
 Scenario A: RMM Deployment (Preferred)
-Deploying via your remote management tool (ConnectWise, Datto, Kaseya, etc.).
-Difficulty: 🟢 Easy
-Pros: Zero-touch deployment; works over the internet (no VPN required); logs are usually captured in the RMM console.
-Cons: Scalability Friction. Since credentials are inside the file, you must save a unique script for each customer in your RMM library (e.g., 50 customers = 50 scripts).
-Tip: If your RMM supports passing "Script Variables" securely, consider using the "Parameter-based" version of this script instead to scale better.
+
+*Deploying via ConnectWise, Datto, Kaseya, Ninja, etc.*
+
+* **Difficulty:** 🟢 Easy
+* **Pros:** Zero-touch; works over internet; logs capture specific failure reasons (e.g., "Security Blocked").
+* **Steps:**
+1. Upload the script to your RMM Library.
+2. **Option A (Best):** Set up script variables in your RMM to pass `-Url`, `-AccessKey`, etc., as parameters.
+3. **Option B (Hardcoded):** Duplicate the script for "Client A", hardcode their keys, and save it as "Liongard Install - Client A".
+4. **Run As:** System or Administrator.
 
 
-Steps:
-Duplicate the script and rename it for your target client (e.g., Liongard Install - Client A).
-Edit the $AccessKey and $AccessSecret inside the file for Client A.
-Upload to your RMM Script Library.
-Schedule: Run Once (or Daily to enforce compliance).
-Run As: System or Administrator.
 
 Scenario B: Group Policy (GPO) / PDQ Deploy
-Deploying via Active Directory GPO or local deployment tools.
-Difficulty: 🔴 Hard (Requires AD/Networking knowledge)
-Pros: Excellent for onboarding new devices automatically when they join the domain; does not require an RMM agent to be installed first.
-Cons: Requires a secured internal file server; devices must be on the domain network (or VPN); slower feedback loop for errors.
 
-Requirements:
-File Server: You must host the .ps1 file on a network share accessible by the Domain Computers group (Read-Only). \\YourDC\NETLOGON\ or \\FileServer\Deploy$ are common choices.
-Permissions: The "System" account of the target computer needs read access to that share.
+*Deploying via Active Directory GPO or local deployment tools.*
 
-Steps (GPO):
-Save the configured script to your network share (e.g., \\dc01\NETLOGON\Liongard_Install.ps1).
-Open Group Policy Management and create a new GPO linked to the OU containing the target Computers.
-Navigate to: Computer Configuration > Policies > Windows Settings > Scripts (Startup/Shutdown).
-Double-click Startup.
-Click PowerShell Scripts tab.
-Click Add and browse to the UNC path of your script (Do not use a local C: path).
-Crucial: Ensure the GPO is enforced and that computers reboot to pick up the script.
+* **Difficulty:** 🔴 Hard (Requires AD/Networking knowledge)
+* **Pros:** Excellent for automatic onboarding of new domain devices.
+* **Requirements:**
+* **File Server:** Host the `.ps1` on a share (e.g., `\\YourDC\NETLOGON\`) accessible by **Domain Computers** (Read-Only).
+
+
+* **Steps:**
+1. Save the configured script to your network share.
+2. Create a GPO linked to the target OU.
+3. Navigate to: **Computer Configuration > Policies > Windows Settings > Scripts (Startup)**.
+4. **PowerShell Scripts tab** > **Add** > Browse to the UNC path.
+5. **Crucial:** Ensure the GPO is enforced and computers reboot to run the script.
+
+
 
 Scenario C: Manual "One-Off" Installation
-Walking up to a machine or remote controlling it individually.
-Difficulty: 🟡 Medium (High Effort)
-Pros: Instant feedback; great for troubleshooting or testing on a "Golden Image."
-Cons: Requires direct local access (or remote control); highly manual; script must be cleaned up manually.
 
-Steps:
-Copy the configured script to a USB drive or a temporary folder on the machine.
-Right-click the file > Run with PowerShell.
-Watch the console window for the "SUCCESS" message.
-Delete the script file immediately to protect the embedded credentials.
+*Walking up to a machine or remote controlling it individually.*
+
+* **Difficulty:** 🟡 Medium (Manual Effort)
+* **Pros:** Instant feedback; great for "Golden Image" prep or troubleshooting.
+* **Steps:**
+1. Copy the configured script to a temporary folder.
+2. Right-click the file > **Run with PowerShell**.
+3. Watch the console for the green "SUCCESS" message.
+4. **Delete the script file immediately** to protect the embedded credentials.
+
+
+
+---
 
 🔧 Troubleshooting
-If the script fails, it is designed to be "noisy." You will find the evidence locally on the target endpoint.
+
+This script is designed to be "noisy." If it fails, it will tell you exactly why in your RMM dashboard or local logs.
+
 Log Locations (On the Endpoint)
-C:\ProgramData\Liongard\ScriptInstall.log
-Check here first. This log contains the logic flow. It will tell you if the download failed, if disk space was low, or if the "Pre-Flight" checks failed.
 
-C:\ProgramData\Liongard\AgentInstall.log
-Check here if the script says "Unknown MSI Error". This is the raw log from the Windows Installer.
+1. **`C:\ProgramData\Liongard\ScriptInstall.log`**
+* *Check here first.* Contains the logic flow (Download status, Pre-Flight checks, Deep Clean results).
 
 
-Common Error Messages
-Error MessageLikely CauseSolutionFATAL ERROR: You must edit the CONFIGURATIONThe script was run with default placeholders.Edit the top 5 lines of the script with real data.INPUT ERROR: Invalid CredentialsThe Access Key or Secret is incorrect.Check for extra spaces in your $AccessKey or $AccessSecret variables.Insufficient disk spaceThe drive has < 200MB free.Clear space on the C: drive.Service installed but not runningThe agent installed but cannot reach Liongard.Usually a firewall/DNS issue. Ensure port 443 is open to *.liongard.com.
+2. **`C:\ProgramData\Liongard\AgentInstall.log`**
+* *Check here for MSI errors.* The raw verbose log from the Windows Installer.
+
+
+
+Common Translated Errors
+
+The script parses cryptic codes into English. Here is what they mean:
+
+| Error Output | Likely Cause | Solution |
+| --- | --- | --- |
+| **SECURITY BLOCK (0x80070005)** | ThreatLocker, SentinelOne, or AppLocker is blocking the MSI temp files. | Whitelist the **Liongard Inc.** certificate or enable Installation Mode. |
+| **SERVICE FAILURE (1920)** | The Agent installed, but the Service refused to start. | Check AV Quarantine for `LiongardAgent.exe` or verify .NET Framework. |
+| **INSTALLER BUSY (1618)** | Another installation (Windows Update) is running. | Wait 15 minutes and try again. |
+| **REGISTRY CORRUPTION (1612)** | "Ghost" registry keys are confusing the installer. | The script attempted a **Deep Clean**. If it still fails, manual registry repair is needed. |
+| **VERSION CONFLICT (1638)** | A newer version is already installed. | Uninstall the existing agent manually first. |
+
+---
+
 📜 Uninstallation
+
 To remove the agent, you do not need this script. You can simply run this command in PowerShell (Admin):
 
 Get-Package -Name "Liongard Agent" | Uninstall-Package -Force
-
