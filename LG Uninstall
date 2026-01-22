@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    Liongard Agent RE-INSTALLATION (v2.9.3 - Aggressive Clean)
+    Liongard Agent RE-INSTALLATION (v2.9.4 - Ghost Hunter Edition)
 .DESCRIPTION
-    - RMM Translation: Outputs "FAILURE_REASON: [English Error]" to RMM StdOut.
-    - Deep Clean: Removes "ghost" registry keys and iterates through ALL install instances.
-    - File Wipe: Aggressively cleans Program Files (x86) and Program Files to remove old data.
-    - Network Resilience: Retries failed downloads.
+    - UPDATED: Scans HKEY_USERS to find agents installed in User Contexts (Fixes "Double Entry" in RMM).
+    - UPDATED: Force-deletes registry keys if MSI uninstall fails (Clears RMM cache).
+    - UPDATED: Log messages clarified to distinguish between "Target Found" and "Removal Success".
+    - Standard: Deep Clean, File Wipe, Network Resilience.
 #>
 
 # --- 1. PARAMETERS (MUST BE FIRST) ---
@@ -72,12 +72,11 @@ function Exit-Smart {
         if ($Code -ne 0) { Write-Host "SCRIPT FAILED (Exit Code $Code)" -ForegroundColor Red }
         else { Write-Host "SCRIPT FINISHED SUCCESSFULLY" -ForegroundColor Green }
         Write-Host "---------------------------------------------------"
-        # Read-Host "Press Enter to close..." # Commented out for RMM automation
     }
     Exit $Code
 }
 
-Write-Log "--- Starting Liongard Agent RE-INSTALLATION (v2.9.3) ---"
+Write-Log "--- Starting Liongard Agent RE-INSTALLATION (v2.9.4 - Ghost Hunter) ---"
 
 # --- 6. Validation ---
 if ([string]::IsNullOrWhiteSpace($Url) -or [string]::IsNullOrWhiteSpace($AccessKey) -or [string]::IsNullOrWhiteSpace($AccessSecret) -or $Url -match "YOUR_") {
@@ -137,62 +136,80 @@ if (-not $DownloadSuccess) {
     Exit-Smart 1
 }
 
-# --- 9 & 10. Aggressive Removal & Deep Clean (REPLACES SECTIONS 9 & 10) ---
-Write-Log "Phase 1: Aggressive Removal & Cleanup..."
+# --- 9. GHOST HUNTER REMOVAL (The Fix) ---
+Write-Log "Phase 1: Ghost Hunter Removal..."
 
-# A. STOP & KILL (Unlock the files)
-Write-Log "Stopping services and killing processes to unlock files..."
-$Services = Get-Service | Where-Object { $_.Name -like "*Liongard*" -or $_.DisplayName -like "*Liongard*" }
-if ($Services) { Stop-Service $Services -Force -ErrorAction SilentlyContinue }
+# Helper to remove Liongard from a specific Registry Hive
+function Remove-LiongardFromHive {
+    param ($HivePath, $HiveName)
+    
+    $Keys = Get-ChildItem -Path "$HivePath\Software\Microsoft\Windows\CurrentVersion\Uninstall" -ErrorAction SilentlyContinue |
+        Get-ItemProperty | Where-Object { $_.DisplayName -like "*Liongard Agent*" }
 
-# Force kill any lingering agent processes that might lock files
-$Procs = Get-Process | Where-Object { $_.ProcessName -in "LiongardAgent", "RoarAgent", "LGAgent" }
-if ($Procs) { Stop-Process $Procs -Force -ErrorAction SilentlyContinue }
-Start-Sleep -Seconds 3
-
-# B. UNINSTALL ALL VERSIONS (Fixes "Still in Installed Programs")
-$UninstallKeys = Get-ChildItem -Path HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall, HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall -ErrorAction SilentlyContinue |
-    Get-ItemProperty | Where-Object { $_.DisplayName -like "*Liongard Agent*" }
-
-if ($UninstallKeys) {
-    foreach ($Key in $UninstallKeys) {
-        $ProdCode = $Key.PSChildName
-        # Fallback if PSChildName isn't the GUID
-        if ($ProdCode -notmatch "{.*}") { 
-             $ProdCode = ($Key.UninstallString -replace "MsiExec.exe", "" -replace "/I", "" -replace "/X", "").Trim() 
-        }
+    foreach ($Key in $Keys) {
+        $Name = $Key.DisplayName
+        $Ver  = $Key.DisplayVersion
+        $Code = $Key.PSChildName
         
-        Write-Log "Removing Detected Version: $($Key.DisplayName) ($ProdCode)"
-        Start-Process "msiexec.exe" -ArgumentList "/x $ProdCode /qn /norestart" -Wait
-    }
-}
+        # Fallback for Product Code
+        if ($Code -notmatch "{.*}") { 
+             $Code = ($Key.UninstallString -replace "MsiExec.exe", "" -replace "/I", "" -replace "/X", "").Trim() 
+        }
 
-# C. DEEP CLEAN REGISTRY (Ghost Keys)
-Write-Log "Phase 2: Deep Registry Clean..."
-$HKCR_Products = "Registry::HKEY_CLASSES_ROOT\Installer\Products"
-if (Test-Path $HKCR_Products) {
-    Get-ChildItem -Path $HKCR_Products -ErrorAction SilentlyContinue | ForEach-Object {
-        $ProdName = (Get-ItemProperty -Path $_.PSPath -Name "ProductName" -ErrorAction SilentlyContinue).ProductName
-        if ($ProdName -like "*Liongard*") {
-            Write-Log "Deleting Ghost Registry Key: $($_.PSPath)" "WARN"
-            Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log "TARGET ACQUIRED in $HiveName: $Name ($Ver) - Code: $Code"
+        
+        # 1. Try Standard Uninstall
+        Start-Process "msiexec.exe" -ArgumentList "/x $Code /qn /norestart" -Wait
+        
+        # 2. RMM CLEANUP: Check if Key still exists. If so, NUKE IT.
+        if (Test-Path $Key.PSPath) {
+            Write-Log "   [WARN] Uninstaller finished but Registry Key remains. Force Deleting to clear RMM..." "WARN"
+            Remove-Item -Path $Key.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Log "   [SUCCESS] Uninstall Verified: Registry Key is GONE."
         }
     }
 }
 
-# D. FILESYSTEM WIPE (Fixes "Files never removed")
-# We check BOTH Program Files folders to catch old 32-bit installs
-$TargetPaths = @(
-    "$env:ProgramFiles\Liongard",
-    "${env:ProgramFiles(x86)}\Liongard",
-    "$env:ProgramData\Liongard\Data" # Optional: Clear old data/logs but keep the script folder
-)
+# A. Scan SYSTEM (HKLM & WOW64)
+Remove-LiongardFromHive -HivePath "HKLM:" -HiveName "System (64-bit)"
+Remove-LiongardFromHive -HivePath "HKLM:\SOFTWARE\WOW6432Node" -HiveName "System (32-bit)"
 
-foreach ($Path in $TargetPaths) {
-    if (Test-Path $Path) {
-        Write-Log "Wiping leftover files in: $Path"
-        # We use SilentlyContinue on the folder itself to avoid errors if it's already empty/gone
-        Remove-Item $Path -Recurse -Force -ErrorAction SilentlyContinue
+# B. Scan USER HIVES (HKU) - This finds the hidden "4.2.8" version
+Write-Log "Scanning User Hives for Ghost Installs..."
+New-PSDrive -PSProvider Registry -Name HKU -Root HKEY_USERS -ErrorAction SilentlyContinue | Out-Null
+$UserSIDs = Get-ChildItem HKU:\ -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "S-1-5-21" } # Match real user SIDs
+
+foreach ($SID in $UserSIDs) {
+    $UserHive = "HKU:\$($SID.PSChildName)"
+    Remove-LiongardFromHive -HivePath $UserHive -HiveName "User Profile ($($SID.PSChildName))"
+}
+
+# --- 10. Deep Clean (Files & Extra Reg) ---
+Write-Log "Phase 2: Deep Clean..."
+
+# Wipe Files
+$Paths = @(
+    "$env:ProgramFiles\Liongard", 
+    "${env:ProgramFiles(x86)}\Liongard", 
+    "$env:ProgramData\Liongard\Data"
+)
+foreach ($P in $Paths) { 
+    if (Test-Path $P) { 
+        Write-Log "Wiping leftover files in: $P"
+        Remove-Item $P -Recurse -Force -ErrorAction SilentlyContinue 
+    } 
+}
+
+# Wipe HKCR Installer Products (Error 1612 Fix)
+$HKCR = "Registry::HKEY_CLASSES_ROOT\Installer\Products"
+if (Test-Path $HKCR) {
+    Get-ChildItem -Path $HKCR -ErrorAction SilentlyContinue | ForEach-Object {
+        $Prod = (Get-ItemProperty -Path $_.PSPath -Name "ProductName" -ErrorAction SilentlyContinue).ProductName
+        if ($Prod -like "*Liongard*") { 
+            Write-Log "Deleting Ghost Registry Key: $($_.PSPath)" "WARN"
+            Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue 
+        }
     }
 }
 
