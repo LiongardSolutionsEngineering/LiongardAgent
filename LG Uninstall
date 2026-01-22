@@ -1,11 +1,10 @@
 <#
 .SYNOPSIS
-    Liongard Agent RE-INSTALLATION (v2.9.4 - Ghost Hunter Edition)
+    Liongard Agent RE-INSTALLATION (v2.9.5 - Syntax Fix)
 .DESCRIPTION
-    - UPDATED: Scans HKEY_USERS to find agents installed in User Contexts (Fixes "Double Entry" in RMM).
-    - UPDATED: Force-deletes registry keys if MSI uninstall fails (Clears RMM cache).
-    - UPDATED: Log messages clarified to distinguish between "Target Found" and "Removal Success".
-    - Standard: Deep Clean, File Wipe, Network Resilience.
+    - FIX: Resolved variable expansion error on line 159 (colon ambiguity).
+    - Ghost Hunter: Scans HKEY_USERS to find agents installed in User Contexts.
+    - Deep Clean: Aggressive removal of files and registry keys.
 #>
 
 # --- 1. PARAMETERS (MUST BE FIRST) ---
@@ -76,7 +75,7 @@ function Exit-Smart {
     Exit $Code
 }
 
-Write-Log "--- Starting Liongard Agent RE-INSTALLATION (v2.9.4 - Ghost Hunter) ---"
+Write-Log "--- Starting Liongard Agent RE-INSTALLATION (v2.9.5 - Syntax Fix) ---"
 
 # --- 6. Validation ---
 if ([string]::IsNullOrWhiteSpace($Url) -or [string]::IsNullOrWhiteSpace($AccessKey) -or [string]::IsNullOrWhiteSpace($AccessSecret) -or $Url -match "YOUR_") {
@@ -156,7 +155,8 @@ function Remove-LiongardFromHive {
              $Code = ($Key.UninstallString -replace "MsiExec.exe", "" -replace "/I", "" -replace "/X", "").Trim() 
         }
 
-        Write-Log "TARGET ACQUIRED in $HiveName: $Name ($Ver) - Code: $Code"
+        # SYNTAX FIX: Using ${HiveName} to prevent colon ambiguity
+        Write-Log "TARGET ACQUIRED in ${HiveName}: $Name ($Ver) - Code: $Code"
         
         # 1. Try Standard Uninstall
         Start-Process "msiexec.exe" -ArgumentList "/x $Code /qn /norestart" -Wait
