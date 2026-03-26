@@ -20,15 +20,7 @@ $ApiTokenSecret          = "REPLACE_WITH_API_TOKEN_SECRET"    # Liongard API tok
 $AgentTokenKey           = "REPLACE_WITH_AGENT_TOKEN_KEY"     # Liongard agent install key
 $AgentTokenSecret        = "REPLACE_WITH_AGENT_TOKEN_SECRET"  # Liongard agent install secret
 $Environment             = "REPLACE_WITH_ENVIRONMENT_NAME"    # Environment name (can be an RMM variable)
-$AgentDescription        = ""                                # Optional agent description; when set, passed as LIONGARDDESCRIPTION
-
-# Optional: Environment Name Aliases
-# Use this hashtable to map specific RMM environment names to their exact Liongard environment names.
-# This is useful when the names differ significantly and normal matching fails.
-$EnvironmentAliases = @{
-    "peak sport and spine" = "peak sport & environment"
-}
-
+$AgentDescription        = ""                                 # Optional agent description; when set, passed as LIONGARDDESCRIPTION
 $EnablePreUninstall      = $true                              # Set to $true to remove any existing agent prior to install
 $IncludeEnvironmentValue = $true                              # Set to $false to omit the LIONGARDENVIRONMENT MSI property
 $RemoveAgentFromPlatform = $false                             # Set to $true to delete the matching agent record via API after a successful pre-uninstall
@@ -514,7 +506,7 @@ function Run-Uninstall {
 
     if ($cmd -match '(?i)msiexec\.exe') {
         $args = $cmd -replace '(?i).*msiexec\.exe\s*',''
-        if ($args -notmatch '(?i)\s/q')        { $args += ' /qn' }
+        if ($args -notmatch '(?i)\s/q')         { $args += ' /qn' }
         if ($args -notmatch '(?i)\s/norestart') { $args += ' /norestart' }
         Write-UninstallLog INFO "Executing MSI uninstall: msiexec.exe $args"
         $p = Start-Process msiexec.exe -ArgumentList $args -PassThru -Wait -WindowStyle Hidden
@@ -804,11 +796,19 @@ function Normalize-EnvironmentName {
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
 
     $trimmed = $Value.Trim()
+
+    # Strip leading articles to improve matching when environments differ by "The/A/An".
     $trimmed = $trimmed -replace '^(?i)\s*(the|a|an)\s+', ''
 
-    # Universally normalize ampersands and the word "and" to space so that names like "H&R" match "H and R"
-    $trimmed = $trimmed -replace '(?i)\band\b', ' '
-    $trimmed = $trimmed -replace '&', ' '
+    # Standardize connective wording so "&" and "and" normalize the same way.
+    # Examples:
+    #   "Adult & Pediatric Dermatology"   -> "Adult and Pediatric Dermatology"
+    #   "Adult and Pediatric Dermatology" -> "Adult and Pediatric Dermatology"
+    $trimmed = $trimmed -replace '\s*&\s*', ' and '
+    $trimmed = $trimmed -replace '(?i)\band\b', ' and '
+
+    # Collapse repeated whitespace after replacements.
+    $trimmed = $trimmed -replace '\s+', ' '
 
     # Remove diacritics before stripping punctuation to improve matching of accented names.
     $formD = $trimmed.Normalize([Text.NormalizationForm]::FormD)
@@ -881,6 +881,8 @@ function Resolve-LiongardEnvironmentName {
     $minNormalizedLength = 4
     $inputNormalized = Normalize-EnvironmentName -Value $InputName
     if (-not $inputNormalized) { return $null }
+
+    Write-Host ("Environment normalization input: '{0}' -> '{1}'" -f $InputName, $inputNormalized)
 
     if ($inputNormalized.Length -lt $minNormalizedLength) {
         $script:EnvironmentResolutionReason = 'TooShort'
@@ -1530,14 +1532,6 @@ $headers = Get-LiongardAuthHeader -ApiTokenKey $ApiTokenKey -ApiTokenSecret $Api
 
 if ($IncludeEnvironmentValue -and -not [string]::IsNullOrWhiteSpace($Environment)) {
     $script:EnvironmentResolutionReason = $null
-
-    $aliasKey = $Environment.Trim().ToLowerInvariant()
-    if ($null -ne $EnvironmentAliases -and $EnvironmentAliases.ContainsKey($aliasKey)) {
-        $mapped = $EnvironmentAliases[$aliasKey]
-        Write-Host ("Mapped provided environment '{0}' to alias '{1}'" -f $Environment, $mapped)
-        $Environment = $mapped
-    }
-
     $resolvedEnvironment = Resolve-LiongardEnvironmentName -InputName $Environment -InstancePrefix $instancePrefix -Headers $headers
     if ($resolvedEnvironment -and -not [string]::Equals($resolvedEnvironment, $Environment, [System.StringComparison]::Ordinal)) {
         Write-Host ("Matched provided environment to Liongard: '{0}' -> '{1}' (Reason: {2})" -f $Environment, $resolvedEnvironment, $script:EnvironmentResolutionReason)
