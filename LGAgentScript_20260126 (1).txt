@@ -1477,15 +1477,6 @@ Assert-ConfigurationValue -Name 'AgentTokenSecret' -Value $AgentTokenSecret
 if ($IncludeEnvironmentValue) {
     Assert-ConfigurationValue -Name 'Environment' -Value $Environment
 
-    # Detect unexpanded RMM variable placeholders (e.g., Asio %companyname% not substituted by platform).
-    # If variable substitution did not occur, the value will still contain a percent-delimited token.
-    if ($Environment -match '%[^%\s]+%') {
-        Write-Error ("Configuration value [Environment] contains an unexpanded RMM variable placeholder: '{0}'. " +
-                     "Confirm the RMM platform (ConnectWise Asio or equivalent) substituted the variable before execution." -f $Environment)
-        Stop-LiongardTranscript
-        return
-    }
-
     # Trim surrounding whitespace that some RMM platforms append during variable substitution.
     $Environment = $Environment.Trim()
 }
