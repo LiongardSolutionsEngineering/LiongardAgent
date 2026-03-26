@@ -14,13 +14,16 @@
 # ================================
 # Partners should replace the placeholder strings below with their tenant-specific values
 # before distributing or executing the script.
+# For ConnectWise Asio: set $Environment to %companyname% directly in this script body.
+# Asio performs text substitution on the script before execution, so PowerShell receives
+# the resolved client name -- no param() block or console configuration required.
 $InstancePrefix          = "us?"                              # Example: us1, us2, us3, eu1, etc.
 $ApiTokenKey             = "REPLACE_WITH_API_TOKEN_KEY"       # Liongard API token key
 $ApiTokenSecret          = "REPLACE_WITH_API_TOKEN_SECRET"    # Liongard API token secret
 $AgentTokenKey           = "REPLACE_WITH_AGENT_TOKEN_KEY"     # Liongard agent install key
 $AgentTokenSecret        = "REPLACE_WITH_AGENT_TOKEN_SECRET"  # Liongard agent install secret
-$Environment             = "REPLACE_WITH_ENVIRONMENT_NAME"    # Environment name (can be an RMM variable)
-$AgentDescription        = ""                                 # Optional agent description; when set, passed as LIONGARDDESCRIPTION
+$Environment             = "%companyname%"                    # Asio substitutes this token with the client name before execution. For manual runs, replace with the environment name directly.
+$AgentDescription        = ""                                # Optional agent description; when set, passed as LIONGARDDESCRIPTION
 $EnablePreUninstall      = $true                              # Set to $true to remove any existing agent prior to install
 $IncludeEnvironmentValue = $true                              # Set to $false to omit the LIONGARDENVIRONMENT MSI property
 $RemoveAgentFromPlatform = $false                             # Set to $true to delete the matching agent record via API after a successful pre-uninstall
@@ -506,7 +509,7 @@ function Run-Uninstall {
 
     if ($cmd -match '(?i)msiexec\.exe') {
         $args = $cmd -replace '(?i).*msiexec\.exe\s*',''
-        if ($args -notmatch '(?i)\s/q')         { $args += ' /qn' }
+        if ($args -notmatch '(?i)\s/q')        { $args += ' /qn' }
         if ($args -notmatch '(?i)\s/norestart') { $args += ' /norestart' }
         Write-UninstallLog INFO "Executing MSI uninstall: msiexec.exe $args"
         $p = Start-Process msiexec.exe -ArgumentList $args -PassThru -Wait -WindowStyle Hidden
@@ -796,19 +799,18 @@ function Normalize-EnvironmentName {
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
 
     $trimmed = $Value.Trim()
-
     # Strip leading articles to improve matching when environments differ by "The/A/An".
     $trimmed = $trimmed -replace '^(?i)\s*(the|a|an)\s+', ''
 
-    # Standardize connective wording so "&" and "and" normalize the same way.
-    # Examples:
-    #   "Adult & Pediatric Dermatology"   -> "Adult and Pediatric Dermatology"
-    #   "Adult and Pediatric Dermatology" -> "Adult and Pediatric Dermatology"
+    # Normalize ampersand to "and" so names like "Adult & Pediatric Dermatology" and
+    # "Adult and Pediatric Dermatology" collapse to the same token string.
+    # Both forms converge here before the non-alpha strip below removes "and" punctuation-free.
     $trimmed = $trimmed -replace '\s*&\s*', ' and '
-    $trimmed = $trimmed -replace '(?i)\band\b', ' and '
 
-    # Collapse repeated whitespace after replacements.
-    $trimmed = $trimmed -replace '\s+', ' '
+    # Strip common legal entity type tokens as whole words before the alphanumeric collapse.
+    # This allows RMM-supplied names like "Acme LLC CSA" to match the Liongard environment
+    # "Acme (CSA)" after parentheses are stripped by the non-alpha pass below.
+    $trimmed = $trimmed -replace '(?i)\b(LLC|LLP|PLLC|INC|CORP|LTD|LP|PC|PA|PLC)\b\.?', ''
 
     # Remove diacritics before stripping punctuation to improve matching of accented names.
     $formD = $trimmed.Normalize([Text.NormalizationForm]::FormD)
@@ -881,8 +883,6 @@ function Resolve-LiongardEnvironmentName {
     $minNormalizedLength = 4
     $inputNormalized = Normalize-EnvironmentName -Value $InputName
     if (-not $inputNormalized) { return $null }
-
-    Write-Host ("Environment normalization input: '{0}' -> '{1}'" -f $InputName, $inputNormalized)
 
     if ($inputNormalized.Length -lt $minNormalizedLength) {
         $script:EnvironmentResolutionReason = 'TooShort'
@@ -1476,6 +1476,18 @@ Assert-ConfigurationValue -Name 'AgentTokenKey' -Value $AgentTokenKey
 Assert-ConfigurationValue -Name 'AgentTokenSecret' -Value $AgentTokenSecret
 if ($IncludeEnvironmentValue) {
     Assert-ConfigurationValue -Name 'Environment' -Value $Environment
+
+    # Detect unexpanded RMM variable placeholders (e.g., Asio %companyname% not substituted by platform).
+    # If variable substitution did not occur, the value will still contain a percent-delimited token.
+    if ($Environment -match '%[^%\s]+%') {
+        Write-Error ("Configuration value [Environment] contains an unexpanded RMM variable placeholder: '{0}'. " +
+                     "Confirm the RMM platform (ConnectWise Asio or equivalent) substituted the variable before execution." -f $Environment)
+        Stop-LiongardTranscript
+        return
+    }
+
+    # Trim surrounding whitespace that some RMM platforms append during variable substitution.
+    $Environment = $Environment.Trim()
 }
 
 Write-ConfigurationSnapshot
