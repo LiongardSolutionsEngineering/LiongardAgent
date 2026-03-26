@@ -1,10 +1,10 @@
 #requires -Version 5.1
 <#
     Liongard Agent deployment script that:
-      • Validates partner-supplied config values.
-      • Optionally uninstalls any existing Liongard Agent (and deletes the platform record when requested).
-      • Queries the Liongard API to detect MachineGuid collisions and supply DEVICEID overrides.
-      • Downloads, installs, and summarizes the MSI result using AgentInstall.log plus transcript logging.
+      * Validates partner-supplied config values.
+      * Optionally uninstalls any existing Liongard Agent (and deletes the platform record when requested).
+      * Queries the Liongard API to detect MachineGuid collisions and supply DEVICEID overrides.
+      * Downloads, installs, and summarizes the MSI result using AgentInstall.log plus transcript logging.
 
     Written by David Chapman, Manager of Partner Support.
 #>
@@ -25,7 +25,7 @@ $AgentTokenSecret        = "REPLACE_WITH_AGENT_TOKEN_SECRET"  # Liongard agent i
 $Environment             = "%companyname%"                    # Asio substitutes this token with the client name before execution. For manual runs, replace with the environment name directly.
 $AgentDescription        = ""                                # Optional agent description; when set, passed as LIONGARDDESCRIPTION
 $EnablePreUninstall      = $true                              # Set to $true to remove any existing agent prior to install
-$IncludeEnvironmentValue = $true                              # Set to $false to omit the LIONGARDENVIRONMENT MSI property
+$IncludeEnvironmentValue = $true                              # Set to $true to omit the LIONGARDENVIRONMENT MSI property
 $RemoveAgentFromPlatform = $false                             # Set to $true to delete the matching agent record via API after a successful pre-uninstall
 $MinimumRemoteDeletionScore = 50                              # Minimum confidence score before deleting the agent record via API
 
@@ -1461,6 +1461,55 @@ function Download-LiongardInstaller {
     return $false
 }
 
+function Get-AsioCompanyName {
+    # Attempts to read the company/client name from the ConnectWise Asio agent's local
+    # registry configuration. This serves as a fallback when Asio's %companyname% token
+    # substitution does not fire (e.g., script deployed as an attached file rather than
+    # inline in the Asio script body).
+    #
+    # Checks both native and WOW6432Node paths, and queries multiple known value names
+    # that Asio versions have used to store the company identifier.
+
+    $asioRegistryPaths = @(
+        'HKLM:\SOFTWARE\ITSPlatform',
+        'HKLM:\SOFTWARE\WOW6432Node\ITSPlatform',
+        'HKLM:\SOFTWARE\ITSPlatform\Endpoint',
+        'HKLM:\SOFTWARE\WOW6432Node\ITSPlatform\Endpoint'
+    )
+
+    $valueNames = @(
+        'CompanyName',
+        'Company',
+        'ClientName',
+        'SiteName',
+        'OrganizationName'
+    )
+
+    foreach ($regPath in $asioRegistryPaths) {
+        if (-not (Test-Path -LiteralPath $regPath)) { continue }
+
+        try {
+            $regProps = Get-ItemProperty -LiteralPath $regPath -ErrorAction Stop
+        }
+        catch {
+            Write-Host "[Asio Fallback] Unable to read registry at '$regPath': $($_.Exception.Message)"
+            continue
+        }
+
+        foreach ($valName in $valueNames) {
+            $prop = $regProps.PSObject.Properties[$valName]
+            if ($prop -and -not [string]::IsNullOrWhiteSpace($prop.Value)) {
+                $resolved = $prop.Value.Trim()
+                Write-Host "[Asio Fallback] Found company name via registry: '$regPath' -> $valName = '$resolved'"
+                return $resolved
+            }
+        }
+    }
+
+    Write-Warning "[Asio Fallback] No company name found in any known Asio registry location."
+    return $null
+}
+
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 
 Start-LiongardTranscript -TargetFolder $Folder
@@ -1479,6 +1528,25 @@ if ($IncludeEnvironmentValue) {
 
     # Trim surrounding whitespace that some RMM platforms append during variable substitution.
     $Environment = $Environment.Trim()
+
+    # Detect unsubstituted Asio token and fall back to local registry lookup.
+    # When Asio's %companyname% substitution does not fire (e.g., script stored as an
+    # attached file instead of inline in the script body), PowerShell receives the raw
+    # token string. This block detects that condition and attempts to resolve the company
+    # name from the Asio agent's local registry keys instead.
+    if ($Environment -match '^%[^%]+%$') {
+        Write-Warning ("Environment value '$Environment' appears to be an unresolved RMM variable token. Attempting local Asio registry fallback...")
+        $asioFallbackName = Get-AsioCompanyName
+        if (-not [string]::IsNullOrWhiteSpace($asioFallbackName)) {
+            Write-Host ("Asio registry fallback succeeded. Using environment name: '$asioFallbackName'")
+            $Environment = $asioFallbackName
+        }
+        else {
+            Write-Error ("Environment value '$Environment' is an unresolved token and the Asio registry fallback did not return a company name. Aborting installation because LIONGARDENVIRONMENT is required.")
+            Stop-LiongardTranscript
+            return
+        }
+    }
 }
 
 Write-ConfigurationSnapshot
