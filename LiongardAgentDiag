@@ -1,0 +1,1598 @@
+# LiongardAgent-Diag.ps1 - Liongard Windows Agent one-shot support diagnostic: collects everything support needs in ONE run when the agent is "installed but the service will not start / no heartbeat" (commonly a code-signing trust problem on hardened Windows Server).
+# STRICTLY READ-ONLY: changes nothing on the machine; only reads state and writes a diagnostic bundle to your Desktop.
+# Output: a folder on your Desktop containing the diagnostic .zip and a readable _report.txt; email the .zip to Liongard support.
+# Privacy: secrets are redacted from collected files, but the bundle can still contain system/network details, so treat it as sensitive.
+# HOW TO RUN (elevated Windows PowerShell recommended): powershell -NoProfile -ExecutionPolicy Bypass -File .\LiongardAgent-Diag.ps1
+# If script execution is locked by group policy, ask support for the escalation steps documented alongside this script.
+# Company: Liongard, Inc.
+
+[CmdletBinding()]
+param(
+    [string] $OutputDir,            # override output location (default: Desktop chain)
+    [int]    $MaxLogTailLines = 60000,
+    [switch] $SkipNetwork          # skip the network connectivity section
+)
+
+# ===== SAVE LOCATION: leave as 'Desktop' to use your Desktop (the default), or set any folder, e.g. 'C:\Temp' or '\\fileserver\share\LiongardDiag' =====
+$OutputLocation = 'Desktop'
+# Plumbing (normally no need to edit): 'Desktop' or blank uses the auto-pick chain below; any other value is used as an explicit folder, created if missing. The -OutputDir <path> command-line parameter still overrides everything.
+$Script:DefaultOutputDir = if ($OutputLocation -and $OutputLocation -ne 'Desktop') { $OutputLocation } else { '' }
+$Script:OutputDirCandidates = @(
+    (Join-Path $env:USERPROFILE 'Desktop'),    # 1. the user's Desktop (default)
+    $env:USERPROFILE,                          # 2. the user's profile root
+    $PSScriptRoot,                             # 3. the folder the script was run from
+    $env:TEMP                                  # 4. temp (last resort)
+)
+# ============================================================================
+
+# --- 0. Bootstrap: constants, capability flags, PS7 relaunch ---
+$Script:DiagVersion = '2.0.0'
+$Script:StartedUtc  = (Get-Date).ToUniversalTime()
+$Script:StartedLoc  = Get-Date
+# Timing via DateTime deltas (CLM-safe); [System.Diagnostics.Stopwatch]::StartNew() is a static method call that is BLOCKED under Constrained Language Mode.
+function Get-ElapsedSec { param([datetime]$Since) try { return ((Get-Date) - $Since).TotalSeconds } catch { return 0 } }
+
+# Relaunch under Windows PowerShell 5.1 if we were started under PowerShell 7 (Core).
+if ($PSVersionTable.PSEdition -eq 'Core' -and -not $env:LG_DIAG_RELAUNCHED) {
+    $winPs = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (Test-Path $winPs) {
+        $env:LG_DIAG_RELAUNCHED = '1'
+        $selfPath = $PSCommandPath
+        if (-not $selfPath) { $selfPath = $MyInvocation.MyCommand.Path }
+        if ($selfPath) {
+            & $winPs -NoProfile -ExecutionPolicy Bypass -File $selfPath @PSBoundParameters
+            exit $LASTEXITCODE
+        }
+    }
+    # No powershell.exe (PS7-only image): fall through and run under pwsh with a warning.
+}
+
+# Language mode: anything other than FullLanguage means Add-Type / New-Object on arbitrary .NET types are restricted (WDAC/AppLocker Constrained Language Mode).
+$Script:LangMode = $ExecutionContext.SessionState.LanguageMode
+$Script:IsCLM    = ($Script:LangMode -ne 'FullLanguage')
+
+# Can we compile a P/Invoke type? Catches both CLM (parse block) and WDAC/AppLocker blocking of csc.exe / the temp DLL load (throws even in FullLanguage).
+$Script:CanCompile = $false
+try {
+    Add-Type -TypeDefinition 'public class LgDiagProbe { public static int Ping() { return 1; } }' -ErrorAction Stop
+    if ([LgDiagProbe]::Ping() -eq 1) { $Script:CanCompile = $true }
+} catch { $Script:CanCompile = $false }
+
+# Elevation. FullLanguage: definitive WindowsPrincipal check. CLM: whoami /priv heuristic (admin-only privileges are absent from a filtered/non-elevated token).
+$Script:IsAdmin      = $false
+$Script:ElevCheckKind = 'unknown'
+try {
+    if (-not $Script:IsCLM) {
+        $id  = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $pr  = New-Object System.Security.Principal.WindowsPrincipal($id)
+        $Script:IsAdmin = $pr.IsInRole([System.Security.Principal.WindowsBuiltinRole]::Administrator)
+        $Script:ElevCheckKind = 'WindowsPrincipal'
+    } else {
+        $priv = (whoami /priv) 2>$null | Out-String
+        $Script:IsAdmin = ($priv -match 'SeTakeOwnershipPrivilege' -or $priv -match 'SeDebugPrivilege' -or $priv -match 'SeLoadDriverPrivilege')
+        $Script:ElevCheckKind = 'whoami-priv-heuristic'
+    }
+} catch { $Script:IsAdmin = $false }
+
+# --- Shared state ---
+$Script:Facts        = @{}
+$Script:Findings     = @()     # verdict records
+$Script:Errors       = @()     # trapped section errors
+$Script:Manifest     = @()     # collected-file manifest rows
+$Script:ReportBuffer = @()
+$Script:SectionTimes = @{}
+$Script:ReportPath   = $null   # set once staging exists
+
+# Known Trusted Signing anchors (verified against LiongardAgentSVC.csproj metadata)
+$Script:ExpectedSubject = 'Liongard, Inc.'
+$Script:ExpectedRoot    = 'Microsoft Identity Verification Root Certificate Authority 2020'
+$Script:CodeSigningEku  = '1.3.6.1.5.5.7.3.3'
+$Script:UpgradeCode     = '088da427-038f-4cad-a5a6-29acd707ff61'
+
+# --- Helpers ---
+function Get-Stamp { return (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') }
+
+function Write-Report {
+    param([string] $Text = '')
+    $Script:ReportBuffer += $Text
+    try { Write-Host $Text } catch {}
+}
+
+function Flush-Report {
+    if ($Script:ReportPath) {
+        try { Set-Content -LiteralPath $Script:ReportPath -Value $Script:ReportBuffer -Encoding ASCII -ErrorAction SilentlyContinue } catch {}
+    }
+}
+
+function Add-Fact { param([string]$Key, $Value) $Script:Facts[$Key] = $Value }
+function Get-FactVal { param([string]$Key) if ($Script:Facts.ContainsKey($Key)) { return $Script:Facts[$Key] } return $null }
+
+function Add-ManifestRow {
+    param([string]$RelPath, [string]$Flags = '')
+    $full = Join-Path $Script:Staging $RelPath
+    $bytes = ''
+    $sha = ''
+    try {
+        if (Test-Path -LiteralPath $full) {
+            $it = Get-Item -LiteralPath $full -ErrorAction SilentlyContinue
+            if ($it -and -not $it.PSIsContainer) {
+                $bytes = $it.Length
+                try { $sha = (Get-FileHash -LiteralPath $full -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash } catch {}
+            }
+        }
+    } catch {}
+    $Script:Manifest += @{ Path = $RelPath; Bytes = $bytes; Sha256 = $sha; Flags = $Flags }
+}
+
+function Get-MaskedSecret {
+    param([string]$Value, [int]$Keep = 4)
+    if ([string]::IsNullOrEmpty($Value)) { return '(empty)' }
+    $len = $Value.Length
+    if ($len -le ($Keep * 2)) { return (('*' * $len) + " (len=$len)") }
+    return ($Value.Substring(0, $Keep) + '...' + $Value.Substring($len - $Keep) + " (len=$len)")
+}
+
+function Test-DirWritable {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return $false }
+        $probe = Join-Path $Path (".lgdiag_" + (Get-Date -Format 'HHmmssfff'))
+        Set-Content -LiteralPath $probe -Value 'x' -ErrorAction Stop
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        return $true
+    } catch { return $false }
+}
+
+function Resolve-OutputDir {
+    # Explicit choices (the -OutputDir parameter, then the configured $DefaultOutputDir) win, and may be created if missing - that is deliberate operator intent.
+    foreach ($explicit in @($OutputDir, $Script:DefaultOutputDir)) {
+        if ($explicit) {
+            if (-not (Test-Path -LiteralPath $explicit)) {
+                try { New-Item -ItemType Directory -Path $explicit -Force -ErrorAction Stop | Out-Null } catch {}
+            }
+            if (Test-DirWritable $explicit) { return $explicit }
+        }
+    }
+    # Automatic fallbacks ($OutputDirCandidates, top of script). READ-ONLY: these are used only if they already exist and are writable; never created here.
+    foreach ($c in $Script:OutputDirCandidates) {
+        if (-not $c) { continue }
+        if (Test-DirWritable $c) { return $c }
+    }
+    return $env:TEMP
+}
+
+function Get-TimeBudgetSeconds { return [int](Get-ElapsedSec $Script:StartedLoc) }
+
+# Run a scriptblock (typically an external tool) in a child job with a hard timeout; cmdlet-only => safe in Constrained Language Mode. Returns output lines (array).
+function Invoke-Timed {
+    param([scriptblock]$Script, [object[]]$ArgList = @(), [int]$TimeoutSec = 20)
+    $out = @()
+    try {
+        $j = Start-Job -ScriptBlock $Script -ArgumentList $ArgList -ErrorAction Stop
+    } catch {
+        return @("[Invoke-Timed could not start job: $($_.Exception.Message)]")
+    }
+    try {
+        if (Wait-Job $j -Timeout $TimeoutSec) {
+            $out = @(Receive-Job $j 2>&1 | ForEach-Object { "$_" })
+        } else {
+            Stop-Job $j -ErrorAction SilentlyContinue
+            $out = @("[TIMEOUT after ${TimeoutSec}s]")
+        }
+    } catch {
+        $out = @("[Invoke-Timed error: $($_.Exception.Message)]")
+    } finally {
+        Remove-Job $j -Force -ErrorAction SilentlyContinue
+    }
+    return $out
+}
+
+# --- Redaction --------------------------------------------------------------
+$Script:RedactionRules = @(
+    @{ Id='R1';  Profiles=@('config'); Pattern='(?i)(key="(?:ROAR_ACCESS_KEY_ID|ROAR_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)"\s+value=")[^"]*(")'; Replacement='${1}[REDACTED]${2}' },
+    # R1b: generic XML-config backstop - any key name containing secret/password/token/accesskey
+    @{ Id='R1b'; Profiles=@('config'); Pattern='(?i)(key="[^"]*(?:secret|password|token|accesskey|access_key)[^"]*"\s+value=")[^"]*(")'; Replacement='${1}[REDACTED]${2}' },
+    # R2a: MSI Property()/command-line format  NAME=value  or  NAME: value  (coarse line-tail; over-redaction is safe)
+    @{ Id='R2a'; Profiles=@('msilog'); Pattern='(?i)((?:LiongardAccessKey|LiongardAccessSecret|RoarAccessKey|RoarAccessSecret|LIONGARDAGENTSERVICEPASSWORD|LIONGARDAGENTSERVICEUSERNAME)["'']?\s*[:=]\s*).+$'; Replacement='${1}[REDACTED-LINE-TAIL]' },
+    # R2b: WiX Burn engine format  (Initializing|Setting) string variable 'NAME' to value 'VALUE'
+    @{ Id='R2b'; Profiles=@('msilog'); Pattern='(?i)(variable ''(?:LiongardAccessKey|LiongardAccessSecret|RoarAccessKey|RoarAccessSecret|LIONGARDAGENTSERVICEPASSWORD|ProxyUrl)'' to value '')[^'']*('')'; Replacement='${1}[REDACTED]${2}' },
+    # R2c: MSI PROPERTY CHANGE format  (Adding|Modifying) NAME property. Its value is 'VALUE'.
+    @{ Id='R2c'; Profiles=@('msilog'); Pattern='(?i)((?:Adding|Modifying) (?:LIONGARDACCESSKEY|LIONGARDACCESSSECRET|ROARACCESSKEY|ROARACCESSSECRET|LIONGARDAGENTSERVICEPASSWORD) property\. Its value is '')[^'']*('')'; Replacement='${1}[REDACTED]${2}' },
+    @{ Id='R3';  Profiles=@('generic'); Pattern='(?i)(X-ROAR-AGENT-KEY\s*[:=]\s*)\S+'; Replacement='${1}[REDACTED]' },
+    @{ Id='R4';  Profiles=@('generic'); Pattern='(?i)(authorization\s*[:=]\s*)(bearer\s+|basic\s+)?\S+'; Replacement='${1}${2}[REDACTED]' },
+    # R5: asset-inventory / network-discovery PII in the Go zap JSON logs (agent.log + service stdout)
+    @{ Id='R5';  Profiles=@('agentlog'); Pattern='(?i)("(?:request_body|response_body|device_ip|device_hostname|device_mac|device_id|device_serial|device_tcp_ports_open|device_tcp_ports_closed)"\s*:\s*)("(?:[^"\\]|\\.)*"|\[[^\]]*\]|[^,}\s]+)'; Replacement='${1}"[REDACTED-asset-inventory]"' },
+    @{ Id='R6';  Profiles=@('generic'); Pattern='(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?key|token)\b(["'']?\s*[:=]\s*["'']?)(?!\[REDACTED)([^\s"'',;]{4,})'; Replacement='${1}${2}[REDACTED]' },
+    @{ Id='R7';  Profiles=@('generic'); Pattern='\b(AGC[A-Za-z0-9$!@#%^&*()_+\-=]{4,})'; Replacement='[REDACTED-KEY]' },
+    # R8: credentials embedded in a URL userinfo  scheme://user:pass@host
+    @{ Id='R8';  Profiles=@('generic'); Pattern='(?i)(://)[^/@\s:]+:[^/@\s]+@'; Replacement='${1}[REDACTED]@' }
+)
+
+function Invoke-Redaction {
+    param([string]$Line, [string]$Profile)
+    $result = $Line
+    foreach ($rule in $Script:RedactionRules) {
+        if (($rule.Profiles -contains $Profile) -or ($rule.Profiles -contains 'generic')) {
+            $result = $result -replace $rule.Pattern, $rule.Replacement
+        }
+    }
+    return $result
+}
+
+# Copy a text file into the bundle with redaction, optionally tail-capped by lines; never uses Get-Content -Raw (agent.log can be 200MB). Returns a flags string.
+function Copy-RedactedFile {
+    param(
+        [string]$Source,
+        [string]$DestRel,          # relative to staging
+        [string]$Profile = 'generic',
+        [int]$TailLines = 0        # 0 = whole file
+    )
+    $dest = Join-Path $Script:Staging $DestRel
+    $flags = ''
+    try {
+        if (-not (Test-Path -LiteralPath $Source)) {
+            Add-ManifestRow $DestRel "[MISSING: source not found]"
+            return '[MISSING]'
+        }
+        $item = Get-Item -LiteralPath $Source -ErrorAction Stop
+        $origBytes = $item.Length
+        $origHash = ''
+        try { $origHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash } catch {}
+
+        # Stream through the redactor (no growing PS array: agent.log can be huge). Counter lives in script scope so the pipeline ForEach block can update it.
+        $Script:RedCounter = 0
+        $truncated = $false
+
+        if ($TailLines -gt 0) {
+            $lines = Get-Content -LiteralPath $Source -Tail $TailLines -ErrorAction Stop
+            if ($null -eq $lines) { $lines = @() }
+            if (@($lines).Count -ge $TailLines) { $truncated = $true }
+            $banner = @()
+            if ($truncated) {
+                $banner = @(
+                    ('######## TRUNCATED BY LiongardAgent-Diag v' + $Script:DiagVersion + ' ########'),
+                    ('Original file: ' + $Source + '  (' + $origBytes + ' bytes)'),
+                    ('Kept: LAST ' + $TailLines + ' lines. SHA256 of ORIGINAL full file: ' + $origHash),
+                    '#############################################################'
+                )
+            }
+            Set-Content -LiteralPath $dest -Value $banner -Encoding ASCII -ErrorAction Stop
+            $lines | ForEach-Object {
+                $r = Invoke-Redaction -Line ([string]$_) -Profile $Profile
+                if ($r -cne ([string]$_)) { $Script:RedCounter++ }
+                $r
+            } | Add-Content -LiteralPath $dest -Encoding ASCII -ErrorAction Stop
+        } else {
+            Set-Content -LiteralPath $dest -Value @() -Encoding ASCII -ErrorAction Stop
+            Get-Content -LiteralPath $Source -ErrorAction Stop | ForEach-Object {
+                $r = Invoke-Redaction -Line ([string]$_) -Profile $Profile
+                if ($r -cne ([string]$_)) { $Script:RedCounter++ }
+                $r
+            } | Add-Content -LiteralPath $dest -Encoding ASCII -ErrorAction Stop
+        }
+        $redCount = $Script:RedCounter
+        if ($truncated) { $flags = "[TRUNCATED last $TailLines lines] " }
+        $flags += "[REDACTED n=$redCount]"
+        Add-ManifestRow $DestRel $flags
+        return $flags
+    } catch {
+        $msg = $_.Exception.Message
+        try { Set-Content -LiteralPath $dest -Value @("[COLLECTION FAILED: $msg]") -Encoding ASCII -ErrorAction SilentlyContinue } catch {}
+        Add-ManifestRow $DestRel "[ERROR: $msg]"
+        return "[ERROR: $msg]"
+    }
+}
+
+# Section wrapper: isolates failures, times, flushes the partial report.
+function Invoke-Section {
+    param([string]$Id, [string]$Index, [string]$Title, [scriptblock]$Body)
+    Write-Report ''
+    Write-Report ('================================================================================')
+    Write-Report ("SECTION $Id - $Title")
+    Write-Report ('================================================================================')
+    $secStart = Get-Date
+    $status = 'OK'
+    $prevEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Stop'
+        & $Body
+    } catch {
+        $status = 'FAILED'
+        $rec = "[$Id $Title] $($_.Exception.GetType().Name): $($_.Exception.Message)"
+        $Script:Errors += $rec
+        Write-Report ("  !! SECTION ERROR (diagnostic continues): " + $_.Exception.Message)
+    } finally {
+        $ErrorActionPreference = $prevEap
+        $secEl = Get-ElapsedSec $secStart
+        $Script:SectionTimes[$Id] = $secEl
+        Flush-Report
+        $line = ("[$Index] {0,-34} {1} ({2:N1}s)" -f $Title, $status, $secEl)
+        try { Write-Host $line } catch {}
+    }
+}
+
+function Add-Finding {
+    param(
+        [string]$Class, [string]$Confidence, [string]$Title,
+        [string[]]$Found, [string]$Meaning, [string]$Fix
+    )
+    $Script:Findings += @{
+        Class = $Class; Confidence = $Confidence; Title = $Title;
+        Found = $Found; Meaning = $Meaning; Fix = $Fix
+    }
+}
+
+# --- Section bodies ---
+
+function Section-System {
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        Write-Report ("OS              : " + $os.Caption + "  (" + $os.Version + ", build " + $os.BuildNumber + ")")
+        Write-Report ("Architecture    : " + $os.OSArchitecture)
+        Write-Report ("Install type    : " + $(if ($os.ProductType -eq 1) { 'Workstation' } else { 'Server' }))
+        Add-Fact 'OS.ProductType' $os.ProductType
+        Add-Fact 'OS.Caption' $os.Caption
+        $boot = $os.LastBootUpTime
+        Write-Report ("Last boot       : " + $boot)
+    } catch { Write-Report ("OS info error: " + $_.Exception.Message) }
+
+    $tzName = ''
+    try { $tzName = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation' -Name TimeZoneKeyName -ErrorAction SilentlyContinue).TimeZoneKeyName } catch {}
+    Write-Report ("Time zone       : " + $tzName)
+    Write-Report ("Local time      : " + $Script:StartedLoc + "   (UTC " + $Script:StartedUtc + ")")
+
+    # Clock skew via w32tm (timed).
+    try {
+        $w32 = Invoke-Timed -TimeoutSec 10 -Script { & w32tm /query /status 2>&1 }
+        $skew = $null
+        foreach ($l in $w32) {
+            if ($l -match 'Phase Offset\s*:\s*([\-0-9\.]+)s') { $skew = [double]$matches[1] }
+        }
+        if ($null -ne $skew) {
+            Add-Fact 'Time.SkewSeconds' $skew
+            Write-Report ("Clock offset    : " + $skew + "s (from w32tm)")
+        } else {
+            Write-Report ("Clock offset    : (w32tm did not report a phase offset)")
+        }
+        $wf = Join-Path $Script:Staging 'evidence\system\w32tm-status.txt'
+        Set-Content -LiteralPath $wf -Value $w32 -Encoding ASCII -ErrorAction SilentlyContinue
+        Add-ManifestRow 'evidence\system\w32tm-status.txt'
+    } catch { Write-Report ("w32tm error: " + $_.Exception.Message) }
+
+    # FIPS / SChannel / .NET / proxy — plain registry reads (HKLM read = CLM-safe).
+    $sys = @()
+    try {
+        $fips = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\FipsAlgorithmPolicy' -Name Enabled -ErrorAction SilentlyContinue).Enabled
+        Add-Fact 'Crypto.FIPS' $fips
+        $sys += "FIPS policy Enabled            : $fips"
+    } catch {}
+    try {
+        $net = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -Name Release -ErrorAction SilentlyContinue).Release
+        $sys += ".NET Framework Release DWORD   : $net"
+    } catch {}
+    try {
+        # Machine-scope env via registry (CLM-safe; avoids the [Environment] static call).
+        $proxyEnv = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name GLOBAL_AGENT_HTTP_PROXY -ErrorAction SilentlyContinue).GLOBAL_AGENT_HTTP_PROXY
+        Add-Fact 'Proxy.GlobalAgent' ([bool]$proxyEnv)
+        $proxyDisp = $(if ($proxyEnv) { Invoke-Redaction -Line ([string]$proxyEnv) -Profile 'generic' } else { '(not set)' })
+        $sys += "GLOBAL_AGENT_HTTP_PROXY (machine): " + $proxyDisp
+    } catch {}
+    try {
+        $sch = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols'
+        if (Test-Path $sch) {
+            $sys += "SCHANNEL protocol overrides present under: $sch (see crypto-policy.txt)"
+            $dump = Get-ChildItem -Path $sch -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $_.Name + ' -> ' + ((Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue | Out-String).Trim()) }
+            Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\system\crypto-policy.txt') -Value $dump -Encoding ASCII -ErrorAction SilentlyContinue
+            Add-ManifestRow 'evidence\system\crypto-policy.txt'
+        }
+    } catch {}
+    # Pending reboot markers
+    try {
+        $pfro = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+        $pending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or `
+                   (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or `
+                   ([bool]$pfro)
+        $sys += "Pending reboot                 : $pending"
+    } catch {}
+    foreach ($s in $sys) { Write-Report ("  " + $s) }
+    try {
+        $osLines = @()
+        $osLines += ('Generated: ' + (Get-Stamp))
+        $osLines += ('Computer : ' + $env:COMPUTERNAME)
+        try { $osLines += ('OS       : ' + $os.Caption + ' ' + $os.Version + ' build ' + $os.BuildNumber + ' ' + $os.OSArchitecture) } catch {}
+        $osLines += ('TimeZone : ' + $tzName)
+        $osLines += ('LocalTime: ' + $Script:StartedLoc + '  (UTC ' + $Script:StartedUtc + ')')
+        $osLines += $sys
+        Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\system\os-time-env.txt') -Value $osLines -Encoding ASCII -ErrorAction SilentlyContinue
+        Add-ManifestRow 'evidence\system\os-time-env.txt'
+    } catch {}
+}
+
+function Section-FindInstall {
+    $installDir = $null
+    $workDir = $null
+    $sources = @()
+
+    # 1. Registry INSTALLLOCATION (both views)
+    foreach ($k in @('HKLM:\SOFTWARE\WOW6432Node\Liongard\RoarAgent','HKLM:\SOFTWARE\Liongard\RoarAgent')) {
+        try {
+            $p = Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue
+            if ($p -and $p.INSTALLLOCATION) { $sources += "registry($k)=" + $p.INSTALLLOCATION; if (-not $installDir) { $installDir = $p.INSTALLLOCATION } }
+        } catch {}
+    }
+    # 2. Service ImagePath dir
+    try {
+        $svcImg = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\roaragent.exe' -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
+        if ($svcImg) {
+            $clean = $svcImg.Trim('"')
+            $dir = Split-Path $clean -Parent
+            $sources += "service.ImagePath=" + $dir
+            if (-not $installDir) { $installDir = $dir }
+        }
+    } catch {}
+    # 3. Default path
+    $default = 'C:\Program Files (x86)\LiongardInc\LiongardAgent'
+    if (-not $installDir -and (Test-Path $default)) { $installDir = $default; $sources += "default=" + $default }
+
+    if ($installDir) { $installDir = $installDir.TrimEnd('\') }
+    Add-Fact 'Install.Dir' $installDir
+    Add-Fact 'Install.Found' ([bool]($installDir -and (Test-Path $installDir)))
+
+    Write-Report ("Install dir     : " + $(if ($installDir) { $installDir } else { '(NOT FOUND)' }))
+    foreach ($s in $sources) { Write-Report ("  source: " + $s) }
+
+    # Path mismatch warning
+    $distinct = @($sources | ForEach-Object { ($_ -split '=',2)[1] } | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') } | Sort-Object -Unique)
+    if ($distinct.Count -gt 1) {
+        Add-Fact 'Install.PathMismatch' $true
+        Write-Report ("  WARNING: install path sources disagree: " + ($distinct -join ' | '))
+    }
+
+    # WORK_DIR (from config) resolved separately - AgentSVCLog + Go logs live there.
+    $workDir = $installDir
+    try {
+        $cfg = Join-Path $installDir 'appsettings-override.config'
+        if ($installDir -and (Test-Path $cfg)) {
+            $raw = Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue
+            foreach ($l in $raw) {
+                if ($l -match 'key="WORK_DIR"\s+value="([^"]*)"') { $workDir = $matches[1].TrimEnd('\') }
+            }
+        }
+    } catch {}
+    Add-Fact 'Install.WorkDir' $workDir
+    Write-Report ("Work dir        : " + $(if ($workDir) { $workDir } else { '(unknown)' }))
+
+    # Binary inventory + SHA256 + version resources
+    if ($installDir -and (Test-Path $installDir)) {
+        $inv = @()
+        foreach ($exe in @('LiongardAgent.exe','LiongardAgentSVC.exe','LiongardAgentUpdater.exe')) {
+            $path = Join-Path $installDir $exe
+            if (Test-Path $path) {
+                $it = Get-Item $path
+                $sha = ''
+                try { $sha = (Get-FileHash $path -Algorithm SHA256).Hash } catch {}
+                $ver = ''
+                try { $ver = $it.VersionInfo.ProductVersion } catch {}
+                $inv += ("{0,-28} ver={1,-12} {2} bytes  mtime={3}" -f $exe, $ver, $it.Length, $it.LastWriteTime)
+                $inv += ("    SHA256=" + $sha)
+                Write-Report ("  " + $exe + "  ver=" + $ver)
+                if ($exe -eq 'LiongardAgent.exe') { Add-Fact 'Install.GoAgentPath' $path; Add-Fact 'Install.GoAgentVersion' $ver }
+                if ($exe -eq 'LiongardAgentSVC.exe') { Add-Fact 'Install.SvcPath' $path }
+            } else {
+                $inv += ("MISSING: " + $exe)
+                Write-Report ("  MISSING: " + $exe)
+            }
+        }
+        Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\install\binary-inventory.txt') -Value $inv -Encoding ASCII -ErrorAction SilentlyContinue
+        Add-ManifestRow 'evidence\install\binary-inventory.txt'
+    } else {
+        Write-Report ("  (agent not installed - downstream sections will be limited)")
+    }
+}
+
+function Section-Service {
+    $out = @()
+    try {
+        $svc = Get-CimInstance Win32_Service -Filter "Name='roaragent.exe'" -ErrorAction SilentlyContinue
+        if (-not $svc) { $svc = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'roaragent|LiongardAgentSVC' -or $_.DisplayName -match 'Liongard' } | Select-Object -First 1 }
+        if ($svc) {
+            Write-Report ("Service         : " + $svc.Name + " (" + $svc.DisplayName + ")")
+            Write-Report ("  State/Start   : " + $svc.State + " / " + $svc.StartMode)
+            Write-Report ("  Run as        : " + $svc.StartName)
+            Add-Fact 'Svc.State' $svc.State
+            Add-Fact 'Svc.Account' $svc.StartName
+            $out += ("Name=" + $svc.Name); $out += ("DisplayName=" + $svc.DisplayName)
+            $out += ("State=" + $svc.State); $out += ("StartMode=" + $svc.StartMode)
+            $out += ("StartName=" + $svc.StartName); $out += ("PathName=" + $svc.PathName)
+        } else {
+            Write-Report ("Service         : NOT FOUND")
+            Add-Fact 'Svc.State' 'NotInstalled'
+            $out += 'Service roaragent.exe not found.'
+        }
+    } catch { Write-Report ("Service query error: " + $_.Exception.Message) }
+
+    # Raw failure actions
+    try {
+        $fa = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\roaragent.exe' -ErrorAction SilentlyContinue
+        if ($fa) { $out += ("FailureActions(raw present)=" + [bool]$fa.FailureActions); $out += ("ImagePath=" + $fa.ImagePath) }
+    } catch {}
+
+    # Processes
+    $goRunning = $false
+    try {
+        $go = Get-Process -Name 'LiongardAgent' -ErrorAction SilentlyContinue
+        $sv = Get-Process -Name 'LiongardAgentSVC','roaragent' -ErrorAction SilentlyContinue
+        $goRunning = [bool]$go
+        Write-Report ("  Go agent proc : " + [bool]$go + "    service proc: " + [bool]$sv)
+        if ($go) { foreach ($g in $go) { $out += ("proc LiongardAgent pid=" + $g.Id + " start=" + $g.StartTime) } }
+    } catch {}
+    Add-Fact 'Proc.GoAgentRunning' $goRunning
+
+    Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\registry\service-roaragent.txt') -Value $out -Encoding ASCII -ErrorAction SilentlyContinue
+    Add-ManifestRow 'evidence\registry\service-roaragent.txt'
+}
+
+function Section-Config {
+    $installDir = Get-FactVal 'Install.Dir'
+    if (-not $installDir) { Write-Report '  (no install dir - skipped)'; return }
+
+    # DEVELOPMENT_MODE from the service exe.config (verbatim copy - no secrets there)
+    $svcCfg = Join-Path $installDir 'LiongardAgentSVC.exe.config'
+    if (Test-Path $svcCfg) {
+        try {
+            $raw = Get-Content -LiteralPath $svcCfg -ErrorAction SilentlyContinue
+            $dev = $false
+            foreach ($l in $raw) { if ($l -match 'key="DEVELOPMENT_MODE"\s+value="([^"]*)"') { $dev = ($matches[1] -match '^(?i:true|1)$') } }
+            Add-Fact 'Config.DevMode' $dev
+            Write-Report ("DEVELOPMENT_MODE: " + $dev)
+            Copy-Item -LiteralPath $svcCfg -Destination (Join-Path $Script:Staging 'evidence\config\LiongardAgentSVC.exe.config') -ErrorAction SilentlyContinue
+            Add-ManifestRow 'evidence\config\LiongardAgentSVC.exe.config'
+        } catch {}
+    }
+
+    # appsettings-override.config: required keys, pre-migration secret presence
+    $cfg = Join-Path $installDir 'appsettings-override.config'
+    if (Test-Path $cfg) {
+        try {
+            $raw = Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue
+            $keys = @{}
+            foreach ($l in $raw) {
+                if ($l -match 'key="([^"]+)"\s+value="([^"]*)"') { $keys[$matches[1]] = $matches[2] }
+            }
+            $required = @('URL','AGENT_ID','AGENT_NAME','AGENT_UID','RESPONSE_QUEUE','WORK_DIR')
+            $missing = @()
+            foreach ($r in $required) { if (-not $keys.ContainsKey($r) -or [string]::IsNullOrEmpty($keys[$r])) { $missing += $r } }
+            Add-Fact 'Config.MissingKeys' $missing
+            if ($keys.ContainsKey('URL')) { Add-Fact 'Config.URL' $keys['URL'] }
+            $preSecrets = @('ROAR_ACCESS_KEY_ID','ROAR_SECRET_ACCESS_KEY','AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY') | Where-Object { $keys.ContainsKey($_) }
+            Add-Fact 'Config.PreMigrationSecretsPresent' ([bool]$preSecrets)
+
+            Write-Report ("Config URL      : " + $(if ($keys.ContainsKey('URL')) { $keys['URL'] } else { '(missing)' }))
+            Write-Report ("Missing keys    : " + $(if ($missing.Count) { $missing -join ', ' } else { '(none)' }))
+            Write-Report ("Pre-migration plaintext creds in config: " + $(if ($preSecrets) { 'PRESENT (migration incomplete): ' + ($preSecrets -join ',') } else { 'ABSENT (migration completed)' }))
+
+            # Redacted copy
+            $redLines = @()
+            foreach ($l in $raw) { $redLines += (Invoke-Redaction -Line ([string]$l) -Profile 'config') }
+            Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\config\appsettings-override.config') -Value $redLines -Encoding ASCII -ErrorAction SilentlyContinue
+            Add-ManifestRow 'evidence\config\appsettings-override.config' '[REDACTED config secrets]'
+        } catch { Write-Report ("  config parse error: " + $_.Exception.Message) }
+    } else {
+        Write-Report ("appsettings-override.config: NOT FOUND (registration may not have completed)")
+        Add-Fact 'Config.MissingFile' $true
+    }
+}
+
+function Section-Registry {
+    $out = @()
+    # Seed to $false so Class C fires when the key is missing entirely (upgrade to $true if found).
+    Add-Fact 'Reg.AgentKeyPresent' $false
+    foreach ($k in @('HKLM:\SOFTWARE\WOW6432Node\Liongard\RoarAgent','HKLM:\SOFTWARE\Liongard\RoarAgent')) {
+        try {
+            $p = Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue
+            if ($p) {
+                $out += ("[$k]")
+                foreach ($prop in $p.PSObject.Properties) {
+                    if ($prop.Name -like 'PS*') { continue }
+                    $val = $prop.Value
+                    if ($prop.Name -eq 'AgentKey') { $val = Get-MaskedSecret ([string]$val) }
+                    $out += ("  " + $prop.Name + " = " + $val)
+                    if ($prop.Name -eq 'AgentKey') { Add-Fact 'Reg.AgentKeyPresent' ([bool]$prop.Value) }
+                    if ($prop.Name -eq 'ProductVersion') { Add-Fact 'Reg.ProductVersion' $prop.Value }
+                }
+            }
+        } catch {}
+    }
+    foreach ($k in @('HKLM:\SOFTWARE\WOW6432Node\Liongard\LiongardAgent\MachineID','HKLM:\SOFTWARE\Liongard\LiongardAgent\MachineID')) {
+        try {
+            $p = Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue
+            if ($p -and $p.AgentGuid) { $out += ("[$k] AgentGuid = " + $p.AgentGuid); Add-Fact 'Reg.AgentGuid' $p.AgentGuid }
+        } catch {}
+    }
+    Write-Report ("Registry AgentKey present : " + (Get-FactVal 'Reg.AgentKeyPresent'))
+    Write-Report ("Registry ProductVersion   : " + (Get-FactVal 'Reg.ProductVersion'))
+    Write-Report ("Registry AgentGuid        : " + (Get-FactVal 'Reg.AgentGuid'))
+
+    # ARP scan
+    $arp = @()
+    foreach ($base in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
+        try {
+            Get-ChildItem $base -ErrorAction SilentlyContinue | ForEach-Object {
+                $d = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+                if ($d.DisplayName -match 'Liongard') {
+                    $arp += ("DisplayName=" + $d.DisplayName + " Version=" + $d.DisplayVersion + " Publisher=" + $d.Publisher)
+                    $arp += ("  QuietUninstall=" + $d.QuietUninstallString)
+                }
+            }
+        } catch {}
+    }
+    if ($arp.Count) { Write-Report ("ARP entries     : " + $arp.Count + " Liongard entry(ies) found") }
+    $out += ''; $out += '--- ARP ---'; $out += $arp
+    Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\registry\liongard-keys.txt') -Value $out -Encoding ASCII -ErrorAction SilentlyContinue
+    Add-ManifestRow 'evidence\registry\liongard-keys.txt'
+    Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\install\arp-uninstall.txt') -Value $arp -Encoding ASCII -ErrorAction SilentlyContinue
+    Add-ManifestRow 'evidence\install\arp-uninstall.txt'
+}
+
+# HRESULT map for WinVerifyTrust
+$Script:HResultMap = @{
+    '0'          = 'SUCCESS - this check would PASS'
+    '2148204800' = 'TRUST_E_NOSIGNATURE (0x800B0100) - file is not signed / signature unreadable'
+    '2148204545' = 'TRUST_E_PROVIDER_UNKNOWN (0x800B0001)'
+    '2148204548' = 'TRUST_E_SUBJECT_NOT_TRUSTED (0x800B0004) - subject failed verification'
+    '2148204809' = 'CERT_E_UNTRUSTEDROOT (0x800B0109) - chain ends in an UNTRUSTED root'
+    '2148204810' = 'CERT_E_CHAINING (0x800B010A) - chain could not be built (partial chain)'
+    '2148204812' = 'CERT_E_REVOKED (0x800B010C) - certificate was revoked'
+    '2148204814' = 'CERT_E_REVOCATION_FAILURE (0x800B010E) - revocation check could not complete'
+    '2148204801' = 'CERT_E_EXPIRED (0x800B0101) - signing cert expired'
+    '2148204817' = 'TRUST_E_EXPLICIT_DISTRUST (0x800B0111) - cert is in the Untrusted/Disallowed store'
+    '2148081683' = 'CRYPT_E_REVOCATION_OFFLINE (0x80092013) - revocation servers UNREACHABLE'
+    '2148081709' = 'CRYPT_E_NO_REVOCATION_CHECK (0x8009202D) - no revocation check performed'
+    '2148098064' = 'TRUST_E_BAD_DIGEST (0x80096010) - file digest mismatch (corrupt/tampered)'
+    '2148098053' = 'TRUST_E_TIME_STAMP (0x80096005) - timestamp countersignature invalid'
+}
+function Resolve-HResult {
+    param([uint32]$Code)
+    $key = ([int64]$Code).ToString()
+    if ($Script:HResultMap.ContainsKey($key)) { return $Script:HResultMap[$key] }
+    return ('0x{0:X8} (unmapped - look up this HRESULT)' -f $Code)
+}
+
+$Script:WinTrustSource = @'
+using System;
+using System.Runtime.InteropServices;
+public static class LgWinTrust {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    class WinTrustFileInfo {
+        UInt32 StructSize = (UInt32)Marshal.SizeOf(typeof(WinTrustFileInfo));
+        IntPtr pszFilePath; IntPtr hFile = IntPtr.Zero; IntPtr pgKnownSubject = IntPtr.Zero;
+        public WinTrustFileInfo(String p) { pszFilePath = Marshal.StringToCoTaskMemAuto(p); }
+    }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    class WinTrustData {
+        UInt32 StructSize = (UInt32)Marshal.SizeOf(typeof(WinTrustData));
+        IntPtr PolicyCallbackData = IntPtr.Zero;
+        IntPtr SIPClientData = IntPtr.Zero;
+        uint UIChoice = 2;              // None
+        uint RevocationChecks = 0;      // None (field; provflags drive revocation)
+        uint UnionChoice = 1;           // File
+        IntPtr FileInfoPtr;
+        uint StateAction = 0;           // Ignore
+        IntPtr StateData = IntPtr.Zero;
+        String URLReference = null;
+        public uint ProvFlags;
+        uint UIContext = 0;             // Execute
+        public WinTrustData(WinTrustFileInfo fi, uint provFlags) {
+            ProvFlags = provFlags;
+            FileInfoPtr = Marshal.AllocCoTaskMem(Marshal.SizeOf(typeof(WinTrustFileInfo)));
+            Marshal.StructureToPtr(fi, FileInfoPtr, false);
+        }
+    }
+    [DllImport("wintrust.dll", ExactSpelling = true, SetLastError = false, CharSet = CharSet.Unicode)]
+    static extern uint WinVerifyTrust(IntPtr hwnd, [MarshalAs(UnmanagedType.LPStruct)] Guid pgActionID, WinTrustData pWVTData);
+    static readonly Guid ActionV2 = new Guid("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");
+    static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+    public static uint Verify(string file, uint provFlags) {
+        var fi = new WinTrustFileInfo(file);
+        var wtd = new WinTrustData(fi, provFlags);
+        return WinVerifyTrust(INVALID_HANDLE_VALUE, ActionV2, wtd);
+    }
+}
+'@
+
+function Section-SignatureGate {
+    $exe = Get-FactVal 'Install.GoAgentPath'
+    $out = @()
+    if (-not $exe -or -not (Test-Path $exe)) {
+        Write-Report '  (LiongardAgent.exe not found - gate check skipped)'
+        Add-Fact 'Gate.Fidelity' 'None'
+        return
+    }
+
+    $fidelity = 'Minimal'
+
+    # --- WinVerifyTrust replica (Full fidelity) ---
+    if ($Script:CanCompile) {
+        try {
+            Add-Type -TypeDefinition $Script:WinTrustSource -ErrorAction Stop
+            $fidelity = 'Full'
+            $osMajor = [Environment]::OSVersion.Version.Major
+            $md = 0x2000  # DisableMD2andMD4 (service sets this on Win7SP1+ / all modern)
+            $variants = @(
+                @{ Name='NoRevocation'; Flags=([uint32](0x10 -bor $md)) },
+                @{ Name='CacheOnly';    Flags=([uint32](0x80 -bor $md -bor 0x1000)) },
+                @{ Name='Exact';        Flags=([uint32](0x80 -bor $md)) }
+            )
+            $results = @{}
+            foreach ($v in $variants) {
+                # Exact runs last; note if it is slow (egress blackhole = evidence).
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $code = [LgWinTrust]::Verify($exe, $v.Flags)
+                $sw.Stop()
+                $results[$v.Name] = $code
+                $interp = Resolve-HResult -Code $code
+                $line = ("WinVerifyTrust [{0,-12}] flags=0x{1:X4} -> 0x{2:X8}  {3}  ({4:N1}s)" -f $v.Name, $v.Flags, $code, $interp, $sw.Elapsed.TotalSeconds)
+                Write-Report ("  " + $line)
+                $out += $line
+            }
+            Add-Fact 'Gate.WinTrust.Exact' ([int64]$results['Exact'])
+            Add-Fact 'Gate.WinTrust.CacheOnly' ([int64]$results['CacheOnly'])
+            Add-Fact 'Gate.WinTrust.NoRev' ([int64]$results['NoRevocation'])
+            if ($results['Exact'] -ne 0 -and $results['CacheOnly'] -eq 0) {
+                Write-Report ("  => Trust chain is OK; gate fails ONLY on online revocation (egress blocked). [Class B]")
+            }
+        } catch {
+            Write-Report ("  WinVerifyTrust replica unavailable: " + $_.Exception.Message)
+            $fidelity = 'Reduced'
+        }
+    } else {
+        $fidelity = $(if ($Script:IsCLM) { 'Minimal' } else { 'Reduced' })
+        Write-Report ("  P/Invoke replica SKIPPED (compiler/language mode). Using cmdlet fallbacks.")
+    }
+
+    # --- Get-AuthenticodeSignature (cmdlet = real WinVerifyTrust, always available) ---
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $exe -ErrorAction Stop
+        Write-Report ("Authenticode    : " + $sig.Status + "  (" + $sig.StatusMessage + ")")
+        Add-Fact 'Gate.Authenticode' ([string]$sig.Status)
+        $out += ("Authenticode status: " + $sig.Status + " - " + $sig.StatusMessage)
+        if ($sig.SignerCertificate) {
+            $out += ("Signer: " + $sig.SignerCertificate.Subject)
+            $out += ("Issuer: " + $sig.SignerCertificate.Issuer)
+            $out += ("Valid : " + $sig.SignerCertificate.NotBefore + " -> " + $sig.SignerCertificate.NotAfter)
+        }
+    } catch { Write-Report ("  Authenticode check error: " + $_.Exception.Message) }
+
+    # --- IsLionGardCert replica (FullLanguage only; certutil fallback in CLM) ---
+    if (-not $Script:IsCLM) {
+        try {
+            $raw = [System.Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile($exe)
+            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($raw)
+            $subj = $cert.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+            $subjOk = ($subj -and ($subj.Trim().ToLower() -eq $Script:ExpectedSubject.ToLower()))
+            Add-Fact 'Gate.Cert.SubjectOk' $subjOk
+            $out += ("Subject SimpleName: '" + $subj + "'  (expected '" + $Script:ExpectedSubject + "') -> " + $subjOk)
+
+            $ekuOk = $false
+            foreach ($ext in $cert.Extensions) {
+                if ($ext -is [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]) {
+                    foreach ($oid in $ext.EnhancedKeyUsages) { if ($oid.Value -eq $Script:CodeSigningEku) { $ekuOk = $true } }
+                }
+            }
+            Add-Fact 'Gate.Cert.EkuOk' $ekuOk
+            $out += ("Code Signing EKU (" + $Script:CodeSigningEku + "): " + $ekuOk)
+
+            $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+            $chain.ChainPolicy.RevocationMode = 'NoCheck'
+            $chain.ChainPolicy.VerificationFlags = 'IgnoreNotTimeValid, IgnoreCtlNotTimeValid'
+            $built = $chain.Build($cert)
+            Add-Fact 'Gate.Cert.ChainBuilt' $built
+            $rootName = ''
+            $pkiHosts = @()
+            if ($chain.ChainElements.Count -gt 0) {
+                $rootName = $chain.ChainElements[$chain.ChainElements.Count-1].Certificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+                for ($i=0; $i -lt $chain.ChainElements.Count; $i++) {
+                    $el = $chain.ChainElements[$i]
+                    $out += ("  chain[$i] " + $el.Certificate.Subject)
+                    # Harvest AIA/CDP URLs from extensions
+                    foreach ($ext in $el.Certificate.Extensions) {
+                        if ($ext.Oid.Value -eq '1.3.6.1.5.5.7.1.1' -or $ext.Oid.Value -eq '2.5.29.31') {
+                            $fmt = $ext.Format($false)
+                            foreach ($m in [regex]::Matches($fmt, 'https?://[^\s\)]+')) { $pkiHosts += $m.Value }
+                        }
+                    }
+                }
+            }
+            foreach ($cs in $chain.ChainStatus) { if ($cs.Status -ne 'NotTimeValid') { $out += ("  chainstatus: " + $cs.Status + " - " + $cs.StatusInformation.Trim()) } }
+            $rootOk = ($rootName -eq $Script:ExpectedRoot)
+            Add-Fact 'Gate.Cert.RootSubject' $rootName
+            Add-Fact 'Gate.Cert.RootOk' $rootOk
+            Add-Fact 'Gate.PkiHosts' (@($pkiHosts | Sort-Object -Unique))
+            Write-Report ("Cert chain root : '" + $rootName + "'  matches expected: " + $rootOk)
+            $out += ("Chain built=" + $built + " root='" + $rootName + "' rootOk=" + $rootOk)
+        } catch {
+            Write-Report ("  IsLionGardCert replica error: " + $_.Exception.Message)
+        }
+    } else {
+        # CLM chain fallback: export signer cert + certutil -urlfetch -verify
+        try {
+            $sig2 = Get-AuthenticodeSignature -LiteralPath $exe -ErrorAction SilentlyContinue
+            if ($sig2 -and $sig2.SignerCertificate) {
+                $cerPath = Join-Path $Script:Staging 'evidence\certs\signer.cer'
+                Export-Certificate -Cert $sig2.SignerCertificate -FilePath $cerPath -Type CERT -Force -ErrorAction SilentlyContinue | Out-Null
+                $cu = Invoke-Timed -TimeoutSec 20 -ArgList @($cerPath) -Script { param($c) & certutil -f -urlfetch -verify $c 2>&1 }
+                Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\certs\certutil-verify.txt') -Value $cu -Encoding ASCII -ErrorAction SilentlyContinue
+                Add-ManifestRow 'evidence\certs\certutil-verify.txt'
+                $joined = ($cu -join "`n")
+                if ($joined -match 'UntrustedRoot|CERT_E_UNTRUSTEDROOT') { Add-Fact 'Gate.Cert.RootOk' $false }
+                if ($joined -match 'offline|CRYPT_E_REVOCATION_OFFLINE') { Add-Fact 'Gate.WinTrust.RevocationOffline' $true }
+                Write-Report ("  certutil -verify captured (see certs/certutil-verify.txt)")
+            }
+        } catch { Write-Report ("  certutil fallback error: " + $_.Exception.Message) }
+    }
+
+    Add-Fact 'Gate.Fidelity' $fidelity
+    Write-Report ("Gate fidelity   : " + $fidelity)
+    Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\certs\gate-replica.txt') -Value $out -Encoding ASCII -ErrorAction SilentlyContinue
+    Add-ManifestRow 'evidence\certs\gate-replica.txt'
+}
+
+function Section-CertEnvironment {
+    $out = @()
+    $rootInRoot = $false
+    $rootInDisallowed = $false
+    try {
+        $rootInRoot = [bool](Get-ChildItem Cert:\LocalMachine\Root -ErrorAction SilentlyContinue | Where-Object { $_.Subject -match [regex]::Escape($Script:ExpectedRoot) })
+    } catch {}
+    try {
+        $rootInDisallowed = [bool](Get-ChildItem Cert:\LocalMachine\Disallowed -ErrorAction SilentlyContinue | Where-Object { $_.Subject -match [regex]::Escape($Script:ExpectedRoot) })
+    } catch {}
+    Add-Fact 'Cert.RootInStore' $rootInRoot
+    Add-Fact 'Cert.RootInDisallowed' $rootInDisallowed
+    Write-Report ("MS Trusted Signing root in LocalMachine\Root      : " + $rootInRoot)
+    Write-Report ("MS Trusted Signing root in LocalMachine\Disallowed: " + $rootInDisallowed)
+    $out += ("RootInRoot=" + $rootInRoot); $out += ("RootInDisallowed=" + $rootInDisallowed)
+
+    try {
+        $ar = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\SystemCertificates\AuthRoot' -Name DisableRootAutoUpdate -ErrorAction SilentlyContinue).DisableRootAutoUpdate
+        Add-Fact 'Cert.DisableRootAutoUpdate' $ar
+        Write-Report ("DisableRootAutoUpdate policy: " + $(if ($ar -eq 1) { '1 (auto root update DISABLED - hardened)' } else { '0/unset (allowed)' }))
+        $out += ("DisableRootAutoUpdate=" + $ar)
+    } catch {}
+    Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\certs\store-scan.txt') -Value $out -Encoding ASCII -ErrorAction SilentlyContinue
+    Add-ManifestRow 'evidence\certs\store-scan.txt'
+}
+
+function Section-CredentialPath {
+    $agentKeyPresent = Get-FactVal 'Reg.AgentKeyPresent'
+    $svcAccount = Get-FactVal 'Svc.Account'
+    $preMig = Get-FactVal 'Config.PreMigrationSecretsPresent'
+    Write-Report ("Registry AgentKey present : " + $agentKeyPresent)
+    Write-Report ("Service account           : " + $svcAccount)
+    $customAccount = $false
+    if ($svcAccount -and ($svcAccount -notmatch '(?i)LocalSystem|S-1-5-18')) { $customAccount = $true }
+    Add-Fact 'Cred.CustomServiceAccount' $customAccount
+    Write-Report ("Custom (non-LocalSystem) service account: " + $customAccount)
+    if ($customAccount) {
+        Write-Report ("  NOTE: a custom service account reads a DIFFERENT per-user credential store")
+        Write-Report ("        than the one the credential may have been written to.")
+    }
+    Write-Report ("Pre-migration secret still in config: " + $preMig)
+    Write-Report ("(Authoritative signal is the event log, section 09. An admin cannot read")
+    Write-Report (" LocalSystem's credential store, so a missing-credential probe here is weak.)")
+}
+
+function Section-EventLogs {
+    if (-not $Script:IsAdmin) { Write-Report '  [PARTIAL: some event data needs elevation]' }
+    $evDir = Join-Path $Script:Staging 'evidence\eventlog'
+
+    # Binary export (best evidence)
+    try {
+        $evtx = Join-Path $evDir 'LiongardAgentLog.evtx'
+        $r = Invoke-Timed -TimeoutSec 30 -ArgList @($evtx) -Script { param($p) & wevtutil epl LiongardAgentLog $p /ow:true 2>&1 }
+        if (Test-Path $evtx) { Add-ManifestRow 'evidence\eventlog\LiongardAgentLog.evtx' } else { Add-ManifestRow 'evidence\eventlog\LiongardAgentLog.evtx' ('[MISSING: ' + ($r -join ' ') + ']') }
+    } catch {}
+
+    # Text dump + pattern match
+    $patterns = @(
+        'A valid signature was not found for the agent process',
+        'Agent process does not appear to have been signed by Liongard',
+        'Certificate does not chain to the expected Microsoft Trusted Signing root',
+        'Certificate is missing the Code Signing EKU',
+        'Certificate subject identity does not match the expected Liongard signing identity',
+        'Failed to fetch agent key from registry',
+        'Failed to fetch agent credential from credential manager',
+        'Error in process start',
+        'Restarting Liongard Agent Service',
+        'Running in development mode - skipping signature verification',
+        'Agent executable file does not exist at path',
+        'Liongard Agent Successfully Started'
+    )
+    try {
+        $events = Get-WinEvent -LogName 'LiongardAgentLog' -MaxEvents 500 -ErrorAction Stop | Sort-Object TimeCreated
+        $txt = @()
+        foreach ($e in $events) {
+            $msg = Invoke-Redaction -Line ($e.Message -replace '\r?\n',' | ') -Profile 'generic'
+            $txt += ('[{0:yyyy-MM-dd HH:mm:ss}] [{1}] [{2}] {3}' -f $e.TimeCreated, $e.LevelDisplayName, $e.ProviderName, $msg)
+        }
+        Set-Content -LiteralPath (Join-Path $evDir 'LiongardAgentLog_last500.txt') -Value $txt -Encoding ASCII -ErrorAction SilentlyContinue
+        Add-ManifestRow 'evidence\eventlog\LiongardAgentLog_last500.txt'
+
+        Write-Report ("Event pattern matches (last 500 events):")
+        foreach ($p in $patterns) {
+            $hits = @($events | Where-Object { $_.Message -match [regex]::Escape($p) })
+            if ($hits.Count -gt 0) {
+                $last = ($hits[-1].TimeCreated).ToString('yyyy-MM-dd HH:mm:ss')
+                Write-Report ("  [{0,4}x, last {1}] {2}" -f $hits.Count, $last, $p)
+                Add-Fact ('Evt.' + ($p -replace '[^A-Za-z]','')) $hits.Count
+            }
+        }
+        # crash-loop metric (24h)
+        $since = (Get-Date).AddHours(-24)
+        $restart = @($events | Where-Object { $_.TimeCreated -gt $since -and $_.Message -match 'Restarting Liongard Agent Service' })
+        Add-Fact 'Evt.RestartCount24h' $restart.Count
+        Write-Report ("Restarts (crash-loop metric, 24h): " + $restart.Count)
+        Add-Fact 'Evt.LogPresent' $true
+    } catch {
+        Write-Report ("  LiongardAgentLog: " + $_.Exception.Message)
+        Add-Fact 'Evt.LogPresent' $false
+    }
+
+    # Filtered Application/System (by ID+provider - locale independent)
+    try {
+        $sys = Get-WinEvent -FilterHashtable @{ LogName='System'; StartTime=(Get-Date).AddDays(-7); Id=@(7000,7009,7011,7031,7034) } -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match 'roaragent|Liongard' } |
+            ForEach-Object { ('[{0:yyyy-MM-dd HH:mm:ss}] id={1} {2}' -f $_.TimeCreated, $_.Id, (Invoke-Redaction -Line ($_.Message -replace '\r?\n',' | ') -Profile 'generic')) }
+        if ($sys) { Set-Content -LiteralPath (Join-Path $evDir 'System_7d_filtered.txt') -Value $sys -Encoding ASCII -ErrorAction SilentlyContinue; Add-ManifestRow 'evidence\eventlog\System_7d_filtered.txt' }
+    } catch {}
+    try {
+        $app = Get-WinEvent -FilterHashtable @{ LogName='Application'; StartTime=(Get-Date).AddDays(-7); Level=@(1,2,3) } -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match 'Liongard|roaragent' } |
+            ForEach-Object { ('[{0:yyyy-MM-dd HH:mm:ss}] {1} {2}' -f $_.TimeCreated, $_.ProviderName, (Invoke-Redaction -Line ($_.Message -replace '\r?\n',' | ') -Profile 'generic')) }
+        if ($app) { Set-Content -LiteralPath (Join-Path $evDir 'Application_7d_filtered.txt') -Value $app -Encoding ASCII -ErrorAction SilentlyContinue; Add-ManifestRow 'evidence\eventlog\Application_7d_filtered.txt' }
+    } catch {}
+}
+
+function Section-CollectLogs {
+    $workDir = Get-FactVal 'Install.WorkDir'
+    $installDir = Get-FactVal 'Install.Dir'
+    if (-not $workDir) { $workDir = $installDir }
+    if (-not $workDir) { Write-Report '  (no work dir - skipped)'; return }
+
+    # Free space precheck
+    try {
+        $drive = (Get-Item $workDir).PSDrive
+        if ($drive.Free -lt 200MB) { Write-Report ("  WARNING: low free space (" + [int]($drive.Free/1MB) + "MB)") }
+    } catch {}
+
+    # Go agent logs
+    $logsDir = Join-Path $workDir 'logs'
+    foreach ($f in @('agent.log','error.log')) {
+        $src = Join-Path $logsDir $f
+        if (Test-Path $src) {
+            $tail = $(if ($f -eq 'agent.log') { $MaxLogTailLines } else { 0 })
+            $flags = Copy-RedactedFile -Source $src -DestRel ("evidence\logs\" + $f) -Profile 'agentlog' -TailLines $tail
+            Write-Report ("  logs\" + $f + "  " + $flags)
+        } else {
+            Add-ManifestRow ("evidence\logs\" + $f) '[MISSING: not found]'
+        }
+    }
+    # gzip backups listing (not collected)
+    try {
+        $gz = Get-ChildItem -Path $logsDir -Filter 'agent-*.log.gz' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name + '  ' + $_.Length + ' bytes  ' + $_.LastWriteTime }
+        if ($gz) { Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\logs\_gzip-backups-listing.txt') -Value $gz -Encoding ASCII -ErrorAction SilentlyContinue; Add-ManifestRow 'evidence\logs\_gzip-backups-listing.txt' }
+    } catch {}
+
+    # C# service log(s) - collect all rolled, full (each ~11MB max); use the 'agentlog' profile because AgentSVCLog captures the Go agent's stdout (same JSON stream as agent.log) and so must get the asset-inventory PII redaction (R5), not just 'generic'.
+    foreach ($pat in @('AgentSVCLog.txt','AgentSVCLog.0.txt','AgentSVCLog.1.txt','AgentSVCLog.2.txt')) {
+        $src = Join-Path $workDir $pat
+        if (Test-Path $src) {
+            $flags = Copy-RedactedFile -Source $src -DestRel ("evidence\logs\" + $pat) -Profile 'agentlog'
+            Write-Report ("  logs\" + $pat + "  " + $flags)
+        }
+    }
+    # Missing-trailing-backslash concat variant in the parent dir
+    try {
+        $parent = Split-Path $workDir -Parent
+        Get-ChildItem -Path $parent -Filter '*AgentSVCLog*.txt' -ErrorAction SilentlyContinue | ForEach-Object {
+            Copy-RedactedFile -Source $_.FullName -DestRel ("evidence\logs\parent_" + $_.Name) -Profile 'agentlog' | Out-Null
+        }
+    } catch {}
+}
+
+function Section-GoRuntime {
+    $agentLog = Join-Path $Script:Staging 'evidence\logs\agent.log'
+    if (-not (Test-Path $agentLog)) { Write-Report '  (no collected agent.log to parse)'; return }
+    try {
+        $lines = Get-Content -LiteralPath $agentLog -ErrorAction SilentlyContinue
+        $lastStart = ''
+        $lastHb = ''
+        $lastOutcome = 'none'      # tracks the MOST RECENT heartbeat attempt (lines are chronological)
+        $errClasses = @{}
+        $statusCodes = @{}
+        $panic = $false
+        $missingUrl = $false
+        foreach ($ln in $lines) {
+            if ($ln -match '"msg":"Starting agent') { $lastStart = $ln }
+            if ($ln -match 'Heartbeat response') {
+                if ($ln -match '"ts":"([^"]+)"') { $lastHb = $matches[1] } else { $lastHb = 'seen' }
+                $lastOutcome = 'success'
+            }
+            if ($ln -match 'Error sending heartbeat') {
+                $cls = 'other'
+                if ($ln -match 'no such host|lookup') { $cls = 'DNS' }
+                elseif ($ln -match 'x509:|certificate signed by|tls:') { $cls = 'TLS' }
+                elseif ($ln -match 'proxyconnect') { $cls = 'PROXY' }
+                elseif ($ln -match 'context deadline exceeded|Timeout exceeded') { $cls = 'TIMEOUT' }
+                elseif ($ln -match 'connection refused|no route to host') { $cls = 'REFUSED' }
+                if (-not $errClasses.ContainsKey($cls)) { $errClasses[$cls] = 0 }
+                $errClasses[$cls]++
+                $lastOutcome = 'error'
+            }
+            if ($ln -match 'Error in heartbeat response' -and $ln -match '"status_code":(\d+)') {
+                $sc = $matches[1]; if (-not $statusCodes.ContainsKey($sc)) { $statusCodes[$sc] = 0 }; $statusCodes[$sc]++
+                $lastOutcome = 'error'
+            }
+            if ($ln -match 'Invalid proxy URL') { $panic = $true }
+            if ($ln -match 'MISSING-URL-ENV-VAR') { $missingUrl = $true }
+        }
+        Add-Fact 'HB.LastSuccess' $lastHb
+        Add-Fact 'HB.LastOutcome' $lastOutcome
+        Add-Fact 'HB.CurrentlyFailing' ($lastOutcome -eq 'error')
+        Add-Fact 'HB.ErrorClasses' $errClasses
+        Add-Fact 'HB.StatusCodes' $statusCodes
+        Add-Fact 'HB.ProxyPanic' $panic
+        Add-Fact 'HB.MissingUrl' $missingUrl
+        Write-Report ("Last 'Starting agent': " + $(if ($lastStart) { 'yes' } else { 'none in window' }))
+        Write-Report ("Last heartbeat success: " + $(if ($lastHb) { $lastHb } else { 'NONE in collected window' }))
+        Write-Report ("Most recent heartbeat attempt outcome: " + $lastOutcome)
+        if ($errClasses.Count) { Write-Report ("Heartbeat error classes (historical in window): " + (($errClasses.GetEnumerator() | ForEach-Object { $_.Key + '=' + $_.Value }) -join ', ')) }
+        if ($statusCodes.Count) { Write-Report ("Heartbeat HTTP status codes: " + (($statusCodes.GetEnumerator() | ForEach-Object { $_.Key + '=' + $_.Value }) -join ', ')) }
+        if ($panic) { Write-Report ("  DETECTED: 'Invalid proxy URL' panic (bad GLOBAL_AGENT_HTTP_PROXY -> crash loop)") }
+        if ($missingUrl) { Write-Report ("  DETECTED: MISSING-URL-ENV-VAR (URL not injected)") }
+    } catch { Write-Report ("  agent.log parse error: " + $_.Exception.Message) }
+}
+
+function Section-SecurityControls {
+    if (-not $Script:IsAdmin) { Write-Report '  [PARTIAL: needs elevation for full data]' }
+    $secDir = Join-Path $Script:Staging 'evidence\security'
+    $installDir = Get-FactVal 'Install.Dir'
+
+    # WDAC / Device Guard
+    try {
+        $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction SilentlyContinue
+        if ($dg) {
+            $ci = @($dg.CodeIntegrityPolicyEnforcementStatus)
+            Set-Content -LiteralPath (Join-Path $secDir 'wdac-deviceguard.txt') -Value ($dg | Out-String) -Encoding ASCII -ErrorAction SilentlyContinue
+            Add-ManifestRow 'evidence\security\wdac-deviceguard.txt'
+            Write-Report ("WDAC CI enforcement status: " + ($ci -join ','))
+        }
+    } catch {}
+
+    # AppLocker effective policy
+    if (Get-Command Get-AppLockerPolicy -ErrorAction SilentlyContinue) {
+        try {
+            $al = Get-AppLockerPolicy -Effective -Xml -ErrorAction SilentlyContinue
+            if ($al) { Set-Content -LiteralPath (Join-Path $secDir 'applocker-effective.xml') -Value $al -Encoding ASCII -ErrorAction SilentlyContinue; Add-ManifestRow 'evidence\security\applocker-effective.xml' }
+        } catch {}
+    }
+
+    # CodeIntegrity + AppLocker event logs filtered for Liongard paths
+    $ciHits = 0
+    try {
+        $ciEvents = Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 200 -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match 'Liongard|roaragent' }
+        $ciHits = @($ciEvents).Count
+        if ($ciHits) { Set-Content -LiteralPath (Join-Path $secDir 'CodeIntegrity_Liongard.txt') -Value (@($ciEvents | ForEach-Object { $_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss') + ' ' + ($_.Message -replace '\r?\n',' | ') })) -Encoding ASCII -ErrorAction SilentlyContinue; Add-ManifestRow 'evidence\security\CodeIntegrity_Liongard.txt' }
+    } catch {}
+    foreach ($alog in @('Microsoft-Windows-AppLocker/EXE and DLL','Microsoft-Windows-AppLocker/MSI and Script')) {
+        try {
+            $ae = Get-WinEvent -LogName $alog -MaxEvents 200 -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'Liongard|roaragent' }
+            if (@($ae).Count) { $ciHits += @($ae).Count }
+        } catch {}
+    }
+    Add-Fact 'Blk.CodeIntegrityHits' $ciHits
+    Write-Report ("CodeIntegrity/AppLocker block events on Liongard paths: " + $ciHits)
+
+    # Defender
+    if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
+        try {
+            $mp = Get-MpComputerStatus -ErrorAction SilentlyContinue
+            if ($mp) {
+                Set-Content -LiteralPath (Join-Path $secDir 'defender.txt') -Value ($mp | Out-String) -Encoding ASCII -ErrorAction SilentlyContinue
+                Add-ManifestRow 'evidence\security\defender.txt'
+                Write-Report ("Defender RealTimeProtection: " + $mp.RealTimeProtectionEnabled)
+            }
+            $threats = Get-MpThreatDetection -ErrorAction SilentlyContinue | Where-Object { $_.Resources -match 'Liongard' }
+            if ($threats) { Write-Report ("  Defender detections mention Liongard: " + @($threats).Count); Add-Fact 'Blk.DefenderLiongard' $true }
+        } catch {}
+    } else { Write-Report ("Defender cmdlets: not available (3rd-party AV or feature absent)") }
+
+    # SecurityCenter2 only on workstation SKUs
+    if ((Get-FactVal 'OS.ProductType') -eq 1) {
+        try {
+            $av = Get-CimInstance -Namespace 'root\SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction SilentlyContinue
+            if ($av) { Write-Report ("Registered AV products: " + (($av | ForEach-Object { $_.displayName }) -join ', ')) }
+        } catch {}
+    }
+
+    # Known EDR services
+    $edr = @('CSFalconService','SentinelAgent','CylanceSvc','Sysmon','Sysmon64','xagt','CarbonBlack','cbdefense','SAVService','HealthService','MsSense','WdNisSvc')
+    try {
+        $found = Get-Service -ErrorAction SilentlyContinue | Where-Object { $edr -contains $_.Name } | ForEach-Object { $_.Name + '(' + $_.Status + ')' }
+        if ($found) { Write-Report ("EDR/AV services present: " + ($found -join ', ')) }
+    } catch {}
+}
+
+function Section-UpdaterForensics {
+    $updDir = Join-Path $Script:Staging 'evidence\install'
+    # Scheduled task
+    if (-not $Script:IsCLM) {
+        try {
+            $svc = New-Object -ComObject 'Schedule.Service'
+            $svc.Connect()
+            $folder = $svc.GetFolder('\Liongard')
+            $task = $folder.GetTask('LiongardAgentUpdater')
+            $info = @()
+            $info += ("State=" + $task.State)
+            $info += ("LastRunTime=" + $task.LastRunTime)
+            $info += ("LastTaskResult=" + $task.LastTaskResult)
+            $info += ("NextRunTime=" + $task.NextRunTime)
+            $info += '--- XML ---'
+            $info += $task.Xml
+            Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\tasks\LiongardAgentUpdater.xml') -Value $info -Encoding ASCII -ErrorAction SilentlyContinue
+            Add-ManifestRow 'evidence\tasks\LiongardAgentUpdater.xml'
+            Write-Report ("Updater task    : State=" + $task.State + " LastResult=" + $task.LastTaskResult)
+        } catch { Write-Report ("  updater task query error: " + $_.Exception.Message) }
+    } else {
+        $q = Invoke-Timed -TimeoutSec 15 -Script { & schtasks /query /tn '\Liongard\LiongardAgentUpdater' /v /fo LIST 2>&1 }
+        Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\tasks\LiongardAgentUpdater.xml') -Value $q -Encoding ASCII -ErrorAction SilentlyContinue
+        Add-ManifestRow 'evidence\tasks\LiongardAgentUpdater.xml'
+        Write-Report ("Updater task    : captured via schtasks")
+    }
+
+    # Updater cache
+    $cache = Join-Path $env:ProgramData 'LionGard\Cache'
+    if (Test-Path $cache) {
+        try {
+            $listing = Get-ChildItem $cache -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName + '  ' + $_.Length + ' bytes  ' + $_.LastWriteTime }
+            Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\install\updater-cache-listing.txt') -Value $listing -Encoding ASCII -ErrorAction SilentlyContinue
+            Add-ManifestRow 'evidence\install\updater-cache-listing.txt'
+            # Install logs from cache (redacted)
+            Get-ChildItem $cache -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object {
+                Copy-RedactedFile -Source $_.FullName -DestRel ("evidence\install\updater-install-logs\" + $_.Name) -Profile 'msilog' | Out-Null
+            }
+            Write-Report ("Updater cache   : " + $cache + " (listed)")
+        } catch {}
+    }
+
+    # Burn bundle logs
+    $tempDirs = @($env:TEMP, 'C:\Windows\Temp', 'C:\Windows\SystemTemp') | Sort-Object -Unique
+    $burnCount = 0
+    foreach ($td in $tempDirs) {
+        if (-not $td -or -not (Test-Path $td)) { continue }
+        try {
+            Get-ChildItem -Path $td -Filter 'Liongard_Agent_*.log' -ErrorAction SilentlyContinue | ForEach-Object {
+                Copy-RedactedFile -Source $_.FullName -DestRel ("evidence\install\burn-bundle-logs\" + $_.Name) -Profile 'msilog' | Out-Null
+                $burnCount++
+            }
+            Get-ChildItem -Path $td -Filter '*_LiongardAgentMsi*.log' -ErrorAction SilentlyContinue | ForEach-Object {
+                Copy-RedactedFile -Source $_.FullName -DestRel ("evidence\install\burn-bundle-logs\" + $_.Name) -Profile 'msilog' | Out-Null
+                $burnCount++
+            }
+        } catch {}
+    }
+    Write-Report ("Bundle/MSI logs collected: " + $burnCount)
+}
+
+# TCP test - FullLanguage batch BeginConnect; CLM uses Test-NetConnection jobs.
+function Test-TcpTargets {
+    param([array]$Targets, [int]$DeadlineSec = 5)
+    $results = @{}
+    if (-not $Script:IsCLM) {
+        $pending = @()
+        foreach ($t in $Targets) {
+            try {
+                $c = New-Object System.Net.Sockets.TcpClient
+                $ar = $c.BeginConnect($t.Host, $t.Port, $null, $null)
+                $pending += @{ Key = ($t.Host + ':' + $t.Port); Client = $c; Ar = $ar }
+            } catch { $results[($t.Host + ':' + $t.Port)] = 'ERROR' }
+        }
+        $deadline = (Get-Date).AddSeconds($DeadlineSec)
+        foreach ($p in $pending) {
+            $remMs = [int]([Math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds))
+            $ok = $false
+            try {
+                if ($p.Ar.AsyncWaitHandle.WaitOne($remMs)) { $p.Client.EndConnect($p.Ar); $ok = $p.Client.Connected }
+            } catch { $ok = $false }
+            $results[$p.Key] = $(if ($ok) { 'OPEN' } else { 'blocked/closed' })
+            try { $p.Client.Close() } catch {}
+        }
+    } else {
+        foreach ($t in $Targets) {
+            $out = Invoke-Timed -TimeoutSec 6 -ArgList @($t.Host, $t.Port) -Script { param($h,$p) (Test-NetConnection $h -Port $p -WarningAction SilentlyContinue).TcpTestSucceeded }
+            $results[($t.Host + ':' + $t.Port)] = $(if ("$out" -match 'True') { 'OPEN' } else { 'blocked/closed' })
+        }
+    }
+    return $results
+}
+
+function Section-Connectivity {
+    if ($SkipNetwork) { Write-Report '  (skipped via -SkipNetwork)'; return }
+    $url = Get-FactVal 'Config.URL'
+    $targets = @()
+    if ($url) {
+        $targets += @{ Host = ('api.' + $url); Port = 443 }
+        $targets += @{ Host = ('timon.' + $url); Port = 443 }
+    }
+    $targets += @{ Host = 'agents.static.liongard.com'; Port = 443 }
+    $targets += @{ Host = 'sqs.us-west-2.amazonaws.com'; Port = 443 }
+    $targets += @{ Host = 'ctldl.windowsupdate.com'; Port = 443 }
+    $targets += @{ Host = 'ctldl.windowsupdate.com'; Port = 80 }
+    # PKI hosts harvested from the signer chain
+    $pki = Get-FactVal 'Gate.PkiHosts'
+    if ($pki) { foreach ($h in $pki) { try { $u = [uri]$h; $targets += @{ Host = $u.Host; Port = $(if ($u.Scheme -eq 'https') {443} else {80}) } } catch {} } }
+
+    $res = Test-TcpTargets -Targets $targets -DeadlineSec 5
+    $out = @()
+    foreach ($k in ($res.Keys | Sort-Object)) {
+        Write-Report ("  " + ("{0,-45} {1}" -f $k, $res[$k]))
+        $out += ("{0,-45} {1}" -f $k, $res[$k])
+        Add-Fact ('Net.' + ($k -replace '[^A-Za-z0-9]','_')) $res[$k]
+    }
+
+    # DNS distinction + served-chain capture for api.<URL>
+    if ($url -and -not $Script:IsCLM) {
+        $apiHost = 'api.' + $url
+        try {
+            $ips = [System.Net.Dns]::GetHostAddresses($apiHost)
+            $out += ("DNS " + $apiHost + " -> " + (($ips | ForEach-Object { $_.IPAddressToString }) -join ', '))
+        } catch { $out += ("DNS " + $apiHost + " FAILED: " + $_.Exception.Message); Add-Fact 'Net.ApiDnsFailed' $true }
+
+        try {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $ar = $tcp.BeginConnect($apiHost, 443, $null, $null)
+            if ($ar.AsyncWaitHandle.WaitOne(5000) -and $tcp.Connected) {
+                $tcp.EndConnect($ar)
+                $captured = @()
+                $cb = [System.Net.Security.RemoteCertificateValidationCallback]{
+                    param($sender, $cert, $chain, $errors)
+                    if ($chain) { foreach ($el in $chain.ChainElements) { $script:__capHost += ,($el.Certificate.Subject + ' <= ' + $el.Certificate.Issuer) } }
+                    return $true
+                }
+                $script:__capHost = @()
+                $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, $cb)
+                # Pin TLS 1.2 - the parameterless AuthenticateAsClient() uses SslProtocols.Default, which on stock .NET Framework 4.x omits 1.2 and fails the handshake.
+                try { $ssl.AuthenticateAsClient($apiHost, $null, [System.Security.Authentication.SslProtocols]'Tls12', $false) }
+                catch { $ssl.AuthenticateAsClient($apiHost) }
+                $out += ("--- TLS served chain for " + $apiHost + " ---")
+                $out += $script:__capHost
+                $issuers = ($script:__capHost -join ' ')
+                if ($issuers -match '(?i)fortinet|fortigate|palo alto|zscaler|sophos|watchguard|sonicwall|netskope|SSL Inspection|Deep Packet') {
+                    Add-Fact 'Net.SslInspection' $true
+                    $out += ('  !! Possible SSL-inspection middlebox (issuer pattern matched)')
+                }
+                $ssl.Close()
+            }
+            $tcp.Close()
+        } catch { $out += ("TLS capture for " + $apiHost + " error: " + $_.Exception.Message) }
+    }
+
+    # winhttp proxy
+    $wp = Invoke-Timed -TimeoutSec 8 -Script { & netsh winhttp show proxy 2>&1 }
+    $out += '--- netsh winhttp show proxy ---'; $out += $wp
+
+    Set-Content -LiteralPath (Join-Path $Script:Staging 'evidence\network\connectivity.txt') -Value $out -Encoding ASCII -ErrorAction SilentlyContinue
+    Add-ManifestRow 'evidence\network\connectivity.txt'
+}
+
+# --- Verdict engine ---
+function Invoke-VerdictEngine {
+    $f = $Script:Facts
+    $fid = Get-FactVal 'Gate.Fidelity'
+
+    # Health gate: the launch-failure classes (A/B/C/D-fingerprint/E/F) describe an agent that is NOT working NOW, so if the Go agent is running AND its most recent heartbeat attempt SUCCEEDED, those classes must NOT fire on stale/historical log entries.
+    $agentRunning = ((Get-FactVal 'Proc.GoAgentRunning') -eq $true)
+    $hbLastOutcome = Get-FactVal 'HB.LastOutcome'
+    $hbFailingNow  = ((Get-FactVal 'HB.CurrentlyFailing') -eq $true)
+    $agentHealthy  = ($agentRunning -and ($hbLastOutcome -eq 'success'))
+    $launchFailing = (-not $agentHealthy)
+
+    # A - untrusted root / partial chain
+    $exact = Get-FactVal 'Gate.WinTrust.Exact'
+    $norev = Get-FactVal 'Gate.WinTrust.NoRev'
+    $rootInStore = Get-FactVal 'Cert.RootInStore'
+    $rootDisallowed = Get-FactVal 'Cert.RootInDisallowed'
+    $rootOk = Get-FactVal 'Gate.Cert.RootOk'
+    $aEvidence = @()
+    if ($norev -ne $null -and ($norev -eq 2148204809 -or $norev -eq 2148204810)) { $aEvidence += ("WinVerifyTrust no-revocation variant -> " + (Resolve-HResult ([uint32]$norev))) }
+    if ($rootOk -eq $false) { $aEvidence += "Signer chain does not terminate in the expected Microsoft Trusted Signing root." }
+    if ($rootInStore -eq $false) { $aEvidence += "MS Trusted Signing root is ABSENT from LocalMachine\Root." }
+    if ($rootDisallowed -eq $true) { $aEvidence += "MS Trusted Signing root is in the Disallowed (explicit distrust) store." }
+    if ($aEvidence.Count -and $launchFailing) {
+        $conf = $(if ($fid -eq 'Full') { 'HIGH' } else { 'MEDIUM' })
+        $fix = 'Trust the Microsoft Trusted Signing root: enable Automatic Root Update, allow ctldl.windowsupdate.com, or GPO-import the "Microsoft Identity Verification Root Certificate Authority 2020" root.'
+        if ($rootDisallowed -eq $true) { $conf = 'HIGH'; $fix = 'Remove the explicit distrust entry: the MS Trusted Signing root is in the Disallowed store. ' + $fix }
+        Add-Finding -Class 'A' -Confidence $conf -Title 'Signature gate fails: untrusted / unbuildable certificate chain' -Found $aEvidence -Meaning 'The C# service cannot validate the agent binary signature, so it never launches the Go agent -> no heartbeat.' -Fix $fix
+    }
+
+    # B - revocation offline
+    $cacheOnly = Get-FactVal 'Gate.WinTrust.CacheOnly'
+    $bEvidence = @()
+    if ($exact -ne $null -and $exact -ne 0 -and $cacheOnly -eq 0) { $bEvidence += ("WinVerifyTrust Exact=" + (Resolve-HResult ([uint32]$exact)) + " but CacheOnly=SUCCESS (matrix delta).") }
+    if ($exact -ne $null -and ($exact -eq 2148081683 -or $exact -eq 2148204814 -or $exact -eq 2148081709)) { $bEvidence += ("WinVerifyTrust Exact -> " + (Resolve-HResult ([uint32]$exact))) }
+    if ((Get-FactVal 'Gate.WinTrust.RevocationOffline') -eq $true) { $bEvidence += 'certutil reported revocation offline.' }
+    if ($bEvidence.Count -and $launchFailing) {
+        Add-Finding -Class 'B' -Confidence $(if ($fid -eq 'Full') { 'HIGH' } else { 'MEDIUM' }) -Title 'Signature gate fails: online revocation check cannot reach CRL/OCSP' -Found $bEvidence -Meaning 'The service gate forces ONLINE revocation checking of the chain (ProvFlags exclude-root). The trust chain itself is fine, but the box cannot reach the revocation servers, so the gate fails at every service (re)start.' -Fix 'Allow outbound to the CRL/OCSP/AIA hosts listed in certs/gate-replica.txt and to ctldl.windowsupdate.com (required at every start, not once).'
+    }
+
+    # C - credential / service account
+    $cEvidence = @()
+    if (Get-FactVal 'Evt.Failedtofetchagentcredentialfromcredentialmanager') { $cEvidence += 'Event log: "Failed to fetch agent credential from credential manager."' }
+    if (Get-FactVal 'Evt.Failedtofetchagentkeyfromregistry') { $cEvidence += 'Event log: "Failed to fetch agent key from registry".' }
+    if ((Get-FactVal 'Reg.AgentKeyPresent') -eq $false) { $cEvidence += 'Registry AgentKey value is absent.' }
+    if ((Get-FactVal 'Cred.CustomServiceAccount') -eq $true) { $cEvidence += ('Service runs as a custom account (' + (Get-FactVal 'Svc.Account') + '), which reads a different credential store than the one written.') }
+    if ($cEvidence.Count -and $launchFailing) {
+        Add-Finding -Class 'C' -Confidence $(if (Get-FactVal 'Evt.Failedtofetchagentcredentialfromcredentialmanager') { 'HIGH' } else { 'MEDIUM' }) -Title 'Agent launch fails: credential / service-account problem' -Found $cEvidence -Meaning 'The service passes the signature gate but cannot retrieve the agent key/secret, so it aborts launching the Go agent (mimics the cert symptom).' -Fix 'Re-register/reinstall to rewrite the credential; if a custom service account is required, ensure the credential exists in THAT account''s store.'
+    }
+
+    # D - missing config keys
+    $missing = Get-FactVal 'Config.MissingKeys'
+    $dEvidence = @()
+    if ($missing -and @($missing).Count -gt 0) { $dEvidence += ('appsettings-override.config is missing required keys: ' + (@($missing) -join ', ')) }
+    if ((Get-FactVal 'Config.MissingFile') -eq $true) { $dEvidence += 'appsettings-override.config not found.' }
+    $errStart = Get-FactVal 'Evt.Errorinprocessstart'
+    if ($errStart -and $errStart -gt 0 -and -not (Get-FactVal 'Evt.Avalidsignaturewasnotfoundfortheagentprocess')) { $dEvidence += ("Recurring 'Error in process start' events (" + $errStart + ") without signature-failure events (NullRef fingerprint of a missing config key).") }
+    if ($dEvidence.Count -and $launchFailing) {
+        Add-Finding -Class 'D' -Confidence $(if ($missing -and @($missing).Count) { 'HIGH' } else { 'MEDIUM' }) -Title 'Agent launch fails: configuration missing/incomplete' -Found $dEvidence -Meaning 'The service throws building the child environment (a missing appsettings key), so the Go agent never launches.' -Fix 'Repair/reinstall the agent to regenerate appsettings-override.config with all required keys.'
+    }
+
+    # E - gate passes, heartbeat fails
+    $errClasses = Get-FactVal 'HB.ErrorClasses'
+    $statusCodes = Get-FactVal 'HB.StatusCodes'
+    if ($hbFailingNow -and $errClasses -and @($errClasses.Keys).Count) {
+        foreach ($k in $errClasses.Keys) {
+            $sub = ''
+            $fix = ''
+            switch ($k) {
+                'DNS'     { $sub = 'E1 DNS resolution failing'; $fix = 'Fix DNS / allow name resolution for the platform host.' }
+                'TLS'     { $sub = 'E2 TLS trust failure'; $fix = 'A TLS-inspecting middlebox or missing CA. The Go agent trusts the Windows store; ensure the served CA chain is trusted there.' ; if ((Get-FactVal 'Net.SslInspection') -eq $true) { $sub = 'E2 TLS failure + SSL-inspection middlebox detected'; } }
+                'PROXY'   { $sub = 'E3 proxy failure'; $fix = 'Fix or remove GLOBAL_AGENT_HTTP_PROXY.' }
+                'TIMEOUT' { $sub = 'E4 connection timeout'; $fix = 'Open outbound 443 to the platform host.' }
+                'REFUSED' { $sub = 'E5 connection refused/unreachable'; $fix = 'Check firewall/routing to the platform host.' }
+                default   { $sub = 'E heartbeat error (other)'; $fix = 'See agent.log error strings.' }
+            }
+            Add-Finding -Class 'E' -Confidence 'HIGH' -Title ('Gate passes but heartbeat fails: ' + $sub) -Found @(('agent.log: ' + $errClasses[$k] + ' "Error sending heartbeat" of class ' + $k)) -Meaning 'The Go agent runs but cannot reach the platform.' -Fix $fix
+        }
+    }
+    if ((Get-FactVal 'HB.ProxyPanic') -eq $true -and -not $agentRunning) {
+        Add-Finding -Class 'E' -Confidence 'HIGH' -Title 'Gate passes but agent crash-loops: invalid proxy URL' -Found @('agent.log: "Invalid proxy URL" panic; cross-check RestartCount24h=' + (Get-FactVal 'Evt.RestartCount24h')) -Meaning 'A malformed GLOBAL_AGENT_HTTP_PROXY makes the Go agent panic on startup; the service relaunches it every 60s.' -Fix 'Correct or clear the GLOBAL_AGENT_HTTP_PROXY environment variable.'
+    }
+    if ($hbFailingNow -and $statusCodes -and ($statusCodes.ContainsKey('401') -or $statusCodes.ContainsKey('403'))) {
+        Add-Finding -Class 'E' -Confidence 'HIGH' -Title 'Gate passes but heartbeat is rejected (401/403)' -Found @('agent.log heartbeat status codes: ' + (($statusCodes.GetEnumerator() | ForEach-Object { $_.Key + '=' + $_.Value }) -join ', ')) -Meaning 'The agent credential is invalid/rejected by the platform (deleted agent or credential mismatch).' -Fix 'Verify the agent record on the platform and re-register if needed.'
+    }
+
+    # F - AppLocker/WDAC/AV block
+    $fEvidence = @()
+    if ((Get-FactVal 'Blk.CodeIntegrityHits') -gt 0) { $fEvidence += ((Get-FactVal 'Blk.CodeIntegrityHits').ToString() + ' CodeIntegrity/AppLocker block events reference Liongard paths.') }
+    if ((Get-FactVal 'Blk.DefenderLiongard') -eq $true) { $fEvidence += 'Defender detections mention Liongard.' }
+    # Only a finding if the agent is NOT running - a real block stops execution; when the agent is running, these are audit-mode/historical events (reported as context, not a fault).
+    if ($fEvidence.Count -and (-not $agentRunning)) {
+        Add-Finding -Class 'F' -Confidence 'HIGH' -Title 'Application-control / AV is blocking the agent' -Found $fEvidence -Meaning 'WDAC/AppLocker/AV prevents the agent binary from executing.' -Fix 'Add a publisher/path allow rule for the LiongardAgent binaries in the relevant policy.'
+    } elseif ($fEvidence.Count) {
+        Write-Report ('  (note: ' + ((Get-FactVal 'Blk.CodeIntegrityHits')) + ' CodeIntegrity/AppLocker events reference Liongard paths, but the agent IS running -> likely audit-mode/historical, not a block)')
+    }
+
+    # G - clock skew
+    $skew = Get-FactVal 'Time.SkewSeconds'
+    if ($skew -ne $null -and (([double]$skew -gt 300) -or ([double]$skew -lt -300))) {
+        Add-Finding -Class 'G' -Confidence 'MEDIUM' -Title 'System clock is badly skewed' -Found @('w32tm phase offset = ' + $skew + 's') -Meaning 'Large clock skew breaks certificate/TLS validation; the short-lived signing leaf makes this especially punishing.' -Fix 'Fix time synchronization (w32tm).'
+    }
+
+    # H - healthy
+    if ($Script:Findings.Count -eq 0) {
+        $gatePass = ($exact -eq 0) -or ((Get-FactVal 'Gate.Authenticode') -eq 'Valid')
+        if ($gatePass) {
+            Add-Finding -Class 'H' -Confidence 'INFO' -Title 'No launch-gate fault found on this machine' -Found @('Signature gate passes; no credential/config/heartbeat errors in the collected window.') -Meaning 'This machine passes every local launch-gate check.' -Fix 'Verify platform-side: the agent record exists and is not deleted, the environment URL is correct, and review the connectivity matrix in network/connectivity.txt.'
+        } else {
+            Add-Finding -Class 'H' -Confidence 'INFO' -Title 'Inconclusive - review the collected evidence' -Found @('No rule fired but the gate result was not clearly PASS.') -Meaning 'Automated rules did not conclude.' -Fix 'Review certs/gate-replica.txt and eventlog/LiongardAgentLog_last500.txt manually.'
+        }
+    }
+
+    # --- Write VERDICT block (goes near the top via re-render at Complete) ---
+    $order = @{ 'HIGH'=0; 'MEDIUM'=1; 'LOW'=2; 'INFO'=3 }
+    $sorted = $Script:Findings | Sort-Object @{ Expression = { $order[$_.Confidence] } }, Class
+    Write-Report ''
+    Write-Report ('Verdict engine produced ' + $Script:Findings.Count + ' finding(s). See the VERDICT block at the top of report.txt.')
+    $Script:SortedFindings = $sorted
+}
+
+# --- Bundle assembly ---
+function New-DiagZip {
+    param([string]$StagingDir, [string]$ZipPath)
+    # 1. Compress-Archive - works in FullLanguage (it is a PS script module, so it FAILS under CLM).
+    try {
+        Compress-Archive -Path (Join-Path $StagingDir '*') -DestinationPath $ZipPath -Force -ErrorAction Stop
+        if (Test-Path $ZipPath) { return $true }
+    } catch {}
+    # 2. .NET ZipFile - FullLanguage only (static method, blocked under CLM).
+    if (-not $Script:IsCLM) {
+        try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+            [System.IO.Compression.ZipFile]::CreateFromDirectory($StagingDir, $ZipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+            if (Test-Path $ZipPath) { return $true }
+        } catch {}
+    }
+    # 3. tar.exe (bsdtar, built into Win10+/Server2019+) writes .zip - external binary, CLM-safe; called DIRECTLY (not via Start-Job) because local compression is fast and Start-Job is refused under a manually-downgraded CLM session, making this the reliable CLM zip path.
+    try {
+        $tar = Join-Path $env:WINDIR 'System32\tar.exe'
+        if (Test-Path $tar) {
+            & $tar -a -c -f $ZipPath -C $StagingDir "." 2>$null
+            if (Test-Path $ZipPath) { return $true }
+        }
+    } catch {}
+    return $false
+}
+
+function Complete-Bundle {
+    param([string]$OutDir, [string]$BaseName)
+
+    # metadata.json
+    $meta = [ordered]@{
+        DiagVersion = $Script:DiagVersion
+        Computer    = $env:COMPUTERNAME
+        StartedLocal= $Script:StartedLoc.ToString('yyyy-MM-dd HH:mm:ss')
+        StartedUtc  = $Script:StartedUtc.ToString('yyyy-MM-dd HH:mm:ss')
+        DurationSec = [int](Get-ElapsedSec $Script:StartedLoc)
+        PSVersion   = $PSVersionTable.PSVersion.ToString()
+        PSEdition   = "$($PSVersionTable.PSEdition)"
+        LanguageMode= "$Script:LangMode"
+        Elevated    = $Script:IsAdmin
+        ElevCheck   = $Script:ElevCheckKind
+        CanCompile  = $Script:CanCompile
+        GateFidelity= (Get-FactVal 'Gate.Fidelity')
+        SectionTimes= $Script:SectionTimes
+    }
+    try { Set-Content -LiteralPath (Join-Path $Script:Staging 'metadata.json') -Value ($meta | ConvertTo-Json -Depth 5) -Encoding ASCII -ErrorAction SilentlyContinue } catch {}
+
+    # errors.txt
+    try { Set-Content -LiteralPath (Join-Path $Script:Staging 'errors.txt') -Value $(if ($Script:Errors.Count) { $Script:Errors } else { @('(no section errors)') }) -Encoding ASCII -ErrorAction SilentlyContinue } catch {}
+
+    # Build the final report.txt: VERDICT + QUICK FACTS header, then the buffered detail, then appendices.
+    $header = @()
+    $header += '================================================================================'
+    $header += (' LIONGARD AGENT DIAGNOSTIC v' + $Script:DiagVersion + '    ' + $env:COMPUTERNAME + '   ' + $Script:StartedLoc.ToString('yyyy-MM-dd HH:mm:ss'))
+    $header += (' Elevated: ' + $(if ($Script:IsAdmin) { 'YES' } else { 'NO' }) + '   LanguageMode: ' + $Script:LangMode + '   PS ' + $PSVersionTable.PSVersion + '   Runtime: ' + [int](Get-ElapsedSec $Script:StartedLoc) + 's')
+    if (-not $Script:IsAdmin) { $header += ' *** RUNNING NON-ELEVATED: admin-only sections were degraded. Re-run elevated for a complete bundle. ***' }
+    $header += '================================================================================'
+    $header += ''
+    $header += '--------------------------------- VERDICT --------------------------------------'
+    if ($Script:SortedFindings) {
+        $n = 1
+        foreach ($fnd in $Script:SortedFindings) {
+            $header += (' [' + $n + '] CLASS ' + $fnd.Class + ' (' + $fnd.Confidence + ' confidence) - ' + $fnd.Title)
+            $header += '     FOUND:'
+            foreach ($e in $fnd.Found) { $header += ('       * ' + $e) }
+            $header += ('     MEANING: ' + $fnd.Meaning)
+            $header += ('     FIX: ' + $fnd.Fix)
+            $header += ''
+            $n++
+        }
+    } else { $header += ' (no findings)'; $header += '' }
+    $header += '-------------------------------- QUICK FACTS -----------------------------------'
+    $header += ('   Agent version (registry / binary)    : ' + (Get-FactVal 'Reg.ProductVersion') + ' / ' + (Get-FactVal 'Install.GoAgentVersion'))
+    $header += ('   Service state / account              : ' + (Get-FactVal 'Svc.State') + ' / ' + (Get-FactVal 'Svc.Account'))
+    $header += ('   Go agent process running             : ' + (Get-FactVal 'Proc.GoAgentRunning'))
+    $header += ('   Signature gate (Authenticode)        : ' + (Get-FactVal 'Gate.Authenticode') + '   fidelity=' + (Get-FactVal 'Gate.Fidelity'))
+    $header += ('   WinVerifyTrust Exact HRESULT         : ' + $(if ($null -ne (Get-FactVal 'Gate.WinTrust.Exact')) { Resolve-HResult ([uint32](Get-FactVal 'Gate.WinTrust.Exact')) } else { 'n/a' }))
+    $header += ('   MS root in Root / Disallowed         : ' + (Get-FactVal 'Cert.RootInStore') + ' / ' + (Get-FactVal 'Cert.RootInDisallowed'))
+    $header += ('   Last heartbeat success (agent.log)   : ' + (Get-FactVal 'HB.LastSuccess'))
+    $header += ('   Restarts in last 24h (crash-loop)    : ' + (Get-FactVal 'Evt.RestartCount24h'))
+    $header += ('   DEVELOPMENT_MODE                     : ' + (Get-FactVal 'Config.DevMode'))
+    $header += ('   Pre-migration creds still in config  : ' + (Get-FactVal 'Config.PreMigrationSecretsPresent'))
+    $header += '--------------------------------------------------------------------------------'
+
+    # Appendix
+    $appendix = @()
+    $appendix += ''
+    $appendix += '================================================================================'
+    $appendix += 'APPENDIX A - EVIDENCE MANIFEST'
+    $appendix += '================================================================================'
+    foreach ($m in $Script:Manifest) {
+        try {
+            $sha = [string]$m.Sha256
+            $shaLen = $(if ($sha.Length -lt 16) { $sha.Length } else { 16 })
+            $appendix += ("{0,-55} {1,12} {2}  {3}" -f $m.Path, $m.Bytes, ($sha.Substring(0, $shaLen)), $m.Flags)
+        } catch { $appendix += ([string]$m.Path + '  ' + [string]$m.Flags) }
+    }
+    $appendix += ''
+    $appendix += 'APPENDIX B - ERRORS DURING COLLECTION'
+    if ($Script:Errors.Count) { foreach ($e in $Script:Errors) { $appendix += ('  ' + $e) } } else { $appendix += '  (none)' }
+
+    $final = $header + $Script:ReportBuffer + $appendix
+    try { Set-Content -LiteralPath $Script:ReportPath -Value $final -Encoding ASCII -ErrorAction SilentlyContinue } catch {}
+
+    # Everything for this run goes into ONE folder inside the output location.
+    $destFolder = Join-Path $OutDir $BaseName
+    try { if (-not (Test-Path -LiteralPath $destFolder)) { New-Item -ItemType Directory -Path $destFolder -Force -ErrorAction Stop | Out-Null } } catch {}
+    if (-not (Test-Path -LiteralPath $destFolder)) { $destFolder = $OutDir }   # fall back to flat if folder creation failed
+
+    $zipPath = Join-Path $destFolder ($BaseName + '.zip')
+    $ok = New-DiagZip -StagingDir $Script:Staging -ZipPath $zipPath
+
+    Write-Host ''
+    if ($ok) {
+        # Readable report sits next to the .zip inside the folder.
+        try { Copy-Item -LiteralPath $Script:ReportPath -Destination (Join-Path $destFolder ($BaseName + '_report.txt')) -Force -ErrorAction SilentlyContinue } catch {}
+        Write-Host ('==> Diagnostic bundle saved to folder:') -ForegroundColor Green
+        Write-Host ('      ' + $destFolder) -ForegroundColor Green
+        Write-Host ('    Email ' + $BaseName + '.zip (inside that folder) to Liongard support.')
+        try { Remove-Item -LiteralPath $Script:Staging -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+    } else {
+        # No zip (e.g. hardened box without tar): drop the raw collected files into the folder.
+        try {
+            Set-Content -LiteralPath (Join-Path $Script:Staging 'READ-ME-FIRST.txt') -Value @(
+                'Automatic zip creation was not available on this machine.',
+                'Please right-click this folder -> Send to -> Compressed (zipped) folder,',
+                'then email the resulting .zip to Liongard support.'
+            ) -Encoding ASCII -ErrorAction SilentlyContinue
+            Get-ChildItem -LiteralPath $Script:Staging -Force -ErrorAction Stop | ForEach-Object {
+                Move-Item -LiteralPath $_.FullName -Destination $destFolder -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item -LiteralPath $Script:Staging -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host ('==> Could not create a .zip. Collected files are in this folder:') -ForegroundColor Yellow
+            Write-Host ('      ' + $destFolder) -ForegroundColor Yellow
+            Write-Host '    Please zip that folder and email it to Liongard support.'
+        } catch {
+            Write-Host ('==> Bundle staging (could not finalize): ' + $Script:Staging) -ForegroundColor Yellow
+        }
+    }
+}
+
+# --- MAIN ---
+$ts = Get-Date -Format 'yyyyMMdd-HHmmss'
+$baseName = 'LiongardAgent-Diag_' + $env:COMPUTERNAME + '_' + $ts
+$outDir = Resolve-OutputDir
+$Script:Staging = Join-Path $env:TEMP ('LiongardDiag_' + $ts)
+
+# Create staging tree
+$evidenceDirs = @('eventlog','logs','config','registry','certs','install','install\updater-install-logs','install\burn-bundle-logs','tasks','network','security','system')
+try {
+    New-Item -ItemType Directory -Path $Script:Staging -Force -ErrorAction Stop | Out-Null
+    foreach ($d in $evidenceDirs) { New-Item -ItemType Directory -Path (Join-Path $Script:Staging ('evidence\' + $d)) -Force -ErrorAction SilentlyContinue | Out-Null }
+} catch {
+    Write-Host ('FATAL: could not create staging dir: ' + $_.Exception.Message) -ForegroundColor Red
+    exit 1
+}
+$Script:ReportPath = Join-Path $Script:Staging 'report.txt'
+
+Write-Host ''
+Write-Host ('Liongard Agent Diagnostic v' + $Script:DiagVersion + ' - collecting (read-only)...') -ForegroundColor Cyan
+Write-Host ('Output will be written to: ' + $outDir)
+if (-not $Script:IsAdmin) { Write-Host 'NOTE: not elevated - some sections will be degraded. Re-run elevated for a complete bundle.' -ForegroundColor Yellow }
+if ($Script:IsCLM) { Write-Host ('NOTE: Constrained Language Mode active - running degraded (gate fidelity reduced).') -ForegroundColor Yellow }
+
+# Section 00 preflight summary into report
+Write-Report ('Preflight: Elevated=' + $Script:IsAdmin + ' (' + $Script:ElevCheckKind + '), LanguageMode=' + $Script:LangMode + ', CanCompile=' + $Script:CanCompile + ', PS=' + $PSVersionTable.PSVersion)
+Flush-Report
+
+try {
+    Invoke-Section -Id '01' -Index '01/15' -Title 'System snapshot'        -Body { Section-System }
+    Invoke-Section -Id '02' -Index '02/15' -Title 'Find agent install'     -Body { Section-FindInstall }
+    Invoke-Section -Id '03' -Index '03/15' -Title 'Service state'          -Body { Section-Service }
+    Invoke-Section -Id '04' -Index '04/15' -Title 'Agent configuration'    -Body { Section-Config }
+    Invoke-Section -Id '05' -Index '05/15' -Title 'Registry forensics'     -Body { Section-Registry }
+    Invoke-Section -Id '06' -Index '06/15' -Title 'Signature gate replica' -Body { Section-SignatureGate }
+    Invoke-Section -Id '07' -Index '07/15' -Title 'Certificate environment'-Body { Section-CertEnvironment }
+    Invoke-Section -Id '08' -Index '08/15' -Title 'Credential path'        -Body { Section-CredentialPath }
+    Invoke-Section -Id '09' -Index '09/15' -Title 'Agent event logs'       -Body { Section-EventLogs }
+    Invoke-Section -Id '10' -Index '10/15' -Title 'Collect agent logs'     -Body { Section-CollectLogs }
+    Invoke-Section -Id '11' -Index '11/15' -Title 'Go agent runtime'       -Body { Section-GoRuntime }
+    Invoke-Section -Id '12' -Index '12/15' -Title 'Security controls'      -Body { Section-SecurityControls }
+    Invoke-Section -Id '13' -Index '13/15' -Title 'Updater forensics'      -Body { Section-UpdaterForensics }
+    Invoke-Section -Id '14' -Index '14/15' -Title 'Connectivity'           -Body { Section-Connectivity }
+    Invoke-Section -Id '15' -Index '15/15' -Title 'Verdict engine'         -Body { Invoke-VerdictEngine }
+} finally {
+    Complete-Bundle -OutDir $outDir -BaseName $baseName
+}
