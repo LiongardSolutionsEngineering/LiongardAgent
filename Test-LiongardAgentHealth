@@ -1,0 +1,938 @@
+#requires -Version 5.1
+<#
+.SYNOPSIS
+    Read-only Liongard Agent health check for RMM execution.
+
+.DESCRIPTION
+    Uses the service-name conventions from David Chapman's Liongard deployment
+    script and the checks agreed on during the 2026-07-14 Anatomy IT call:
+      - Is a Liongard service installed and running?
+      - Is its process actually running?
+      - Does the agent log location exist and contain recent activity?
+
+    It also reports executable signature status and recent Liongard Agent event
+    log errors because Anatomy IT is investigating certificate validation and
+    process-start failures.
+
+    The script does not start, stop, install, uninstall, or repair anything.
+
+.PARAMETER MaximumLogAgeMinutes
+    Maximum age of the newest agent log file before log activity is stale.
+
+.PARAMETER EventLookbackHours
+    Lookback window for Liongard-related Warning and Error events.
+
+.PARAMETER LogPath
+    Optional explicit agent log directory. May be supplied more than once.
+
+.PARAMETER Json
+    Emit the complete result as compact JSON after the RMM summary line.
+
+.PARAMETER WaitForInitialization
+    Poll after an install, upgrade, reboot, or service restart before evaluating
+    the final state. Routine scheduled checks should leave this disabled.
+
+.OUTPUTS
+    Exit 0 = HEALTHY
+    Exit 1 = DEGRADED
+    Exit 2 = UNHEALTHY
+    Exit 3 = UNKNOWN
+#>
+
+[CmdletBinding()]
+param(
+    [ValidateRange(1, 10080)]
+    [int]$MaximumLogAgeMinutes = 60,
+
+    [ValidateRange(1, 168)]
+    [int]$EventLookbackHours = 24,
+
+    [string[]]$LogPath = @(),
+
+    [switch]$Json,
+
+    [switch]$WaitForInitialization,
+
+    [ValidateRange(15, 1800)]
+    [int]$InitializationTimeoutSeconds = 300,
+
+    [ValidateRange(5, 60)]
+    [int]$PollIntervalSeconds = 15,
+
+    [string]$ApprovedAgentVersion = '',
+
+    [ValidateRange(1, 100)]
+    [int]$MinimumFreeDiskPercent = 10,
+
+    [ValidateRange(100, 102400)]
+    [int]$MinimumFreeDiskMB = 1024,
+
+    [ValidateRange(50, 102400)]
+    [int]$MaximumProcessMemoryMB = 1024,
+
+    [ValidateRange(1, 100)]
+    [int]$MaximumAverageCpuPercent = 80,
+
+    [ValidateRange(1, 20)]
+    [int]$ResourceSampleCount = 3,
+
+    [ValidateRange(1, 30)]
+    [int]$ResourceSampleIntervalSeconds = 2,
+
+    [ValidateRange(1, 100000)]
+    [int]$MaximumLogFolderMB = 2048,
+
+    [ValidateRange(1, 1000)]
+    [int]$RecurringLogErrorThreshold = 5,
+
+    [ValidateRange(1, 168)]
+    [int]$MaximumTimeSyncAgeHours = 24,
+
+    [string]$InstancePrefix = '',
+
+    [string]$ApiTokenKey = '',
+
+    [string]$ApiTokenSecret = '',
+
+    [ValidateRange(1, 168)]
+    [int]$PlatformHeartbeatFreshHours = 24,
+
+    [string[]]$RequiredFilePath = @()
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Get-LiongardServiceNames {
+    @(
+        'roaragent',
+        'roaragent.exe',
+        'LiongardAgentSVC',
+        'LiongardAgent',
+        'Liongard Agent'
+    )
+}
+
+function Get-LiongardProcessNames {
+    @(
+        'roaragent',
+        'LiongardAgentSVC',
+        'LiongardAgent'
+    )
+}
+
+function Get-LiongardInstalledVersion {
+    foreach ($root in @(
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        )) {
+        foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
+            $item = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+            if ($item.DisplayName -match '^Liongard Agent$|^Roar Agent$' -and $item.DisplayVersion) {
+                return [string]$item.DisplayVersion
+            }
+        }
+    }
+    $null
+}
+
+function Test-IsElevated {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        $false
+    }
+}
+
+function Get-LiongardAuthHeader {
+    param(
+        [string]$Key,
+        [string]$Secret
+    )
+
+    $bytes = [Text.Encoding]::UTF8.GetBytes("$Key`:$Secret")
+    @{
+        'X-ROAR-API-KEY' = [Convert]::ToBase64String($bytes)
+        'User-Agent'     = 'LiongardAgentHealth/1.0'
+    }
+}
+
+function ConvertTo-DateTimeOffsetOrNull {
+    param([object]$Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [DateTimeOffset]) { return $Value.ToUniversalTime() }
+    if ($Value -is [DateTime]) { return ([DateTimeOffset]$Value).ToUniversalTime() }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    try { ([DateTimeOffset]::Parse($text)).ToUniversalTime() } catch { $null }
+}
+
+function Get-LiongardAgentHeartbeatTime {
+    param([object]$Agent)
+
+    foreach ($key in @(
+            'LastHeartbeat', 'LastHeartbeatAt', 'LastHeartbeatTime',
+            'LastCheckIn', 'LastCheckin', 'LastCheckInAt', 'LastCheckinAt',
+            'LastSeen', 'LastSeenAt', 'LastConnected', 'LastConnectedAt',
+            'HeartbeatLastReceived', 'UpdatedAt'
+        )) {
+        $parsed = ConvertTo-DateTimeOffsetOrNull -Value (Get-PropertyValue -InputObject $Agent -Name $key)
+        if ($parsed) { return $parsed }
+    }
+
+    $data = Get-PropertyValue -InputObject $Agent -Name 'Data'
+    if ($data) {
+        foreach ($key in @(
+                'LastHeartbeat', 'LastHeartbeatAt', 'LastHeartbeatTime',
+                'LastCheckIn', 'LastCheckin', 'LastCheckInAt', 'LastCheckinAt',
+                'LastSeen', 'LastSeenAt', 'LastConnected', 'LastConnectedAt',
+                'HeartbeatLastReceived', 'UpdatedAt'
+            )) {
+            $parsed = ConvertTo-DateTimeOffsetOrNull -Value (Get-PropertyValue -InputObject $data -Name $key)
+            if ($parsed) { return $parsed }
+        }
+    }
+    $null
+}
+
+function Get-LocalMachineGuid {
+    try {
+        [string](Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid
+    }
+    catch {
+        $null
+    }
+}
+
+function Get-LiongardPlatformAgent {
+    param(
+        [string]$Prefix,
+        [string]$Key,
+        [string]$Secret,
+        [string]$MachineGuid
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Prefix) -or
+        [string]::IsNullOrWhiteSpace($Key) -or
+        [string]::IsNullOrWhiteSpace($Secret) -or
+        [string]::IsNullOrWhiteSpace($MachineGuid)) {
+        return [pscustomobject]@{ Attempted = $false; Agents = @(); Error = $null }
+    }
+
+    $safePrefix = $Prefix.Trim()
+    if ($safePrefix -match '^https?://') { $safePrefix = ([Uri]$safePrefix).Host.Split('.')[0] }
+    if ($safePrefix -match '\.app\.liongard\.com$') { $safePrefix = $safePrefix.Split('.')[0] }
+    $escapedGuid = $MachineGuid.Trim() -replace "'", "''"
+    $conditions = [Uri]::EscapeDataString("MachineGuid = '$escapedGuid'")
+    $uri = "https://$safePrefix.app.liongard.com/api/v1/agents?conditions=$conditions"
+
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Headers (Get-LiongardAuthHeader -Key $Key -Secret $Secret) -Method Get -ErrorAction Stop
+        [pscustomobject]@{ Attempted = $true; Agents = @($response); Error = $null }
+    }
+    catch {
+        [pscustomobject]@{ Attempted = $true; Agents = @(); Error = $_.Exception.Message }
+    }
+}
+
+function Get-PropertyValue {
+    param(
+        [object]$InputObject,
+        [string]$Name,
+        [object]$Default = $null
+    )
+
+    if ($null -eq $InputObject) { return $Default }
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $Default }
+    $property.Value
+}
+
+function Resolve-ServiceExecutablePath {
+    param([object]$Service)
+
+    $pathName = [string](Get-PropertyValue -InputObject $Service -Name 'PathName')
+    if ([string]::IsNullOrWhiteSpace($pathName)) { return $null }
+
+    $expanded = [Environment]::ExpandEnvironmentVariables($pathName.Trim())
+    if ($expanded -match '^"(?<path>[^"]+)"') { return $Matches['path'] }
+    if ($expanded -match '^(?<path>.+?\.exe)(?:\s|$)') { return $Matches['path'].Trim() }
+    $expanded
+}
+
+function Get-CandidateLogPaths {
+    param(
+        [string[]]$ExplicitPaths,
+        [string]$ExecutablePath
+    )
+
+    $paths = New-Object System.Collections.Generic.List[string]
+    foreach ($path in $ExplicitPaths) {
+        if (-not [string]::IsNullOrWhiteSpace($path)) {
+            $paths.Add([Environment]::ExpandEnvironmentVariables($path))
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ExecutablePath)) {
+        $exeFolder = Split-Path -Parent $ExecutablePath
+        $paths.Add((Join-Path $exeFolder 'Logs'))
+        $paths.Add((Join-Path $exeFolder 'logs'))
+    }
+
+    foreach ($path in @(
+        "$env:ProgramData\Liongard\Logs",
+        "$env:ProgramData\Liongard\logs",
+        "$env:ProgramFiles\Liongard\Logs",
+        "${env:ProgramFiles(x86)}\Liongard\Logs",
+        'C:\Liongard\Logs',
+        'C:\Liongard\logs'
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace($path)) { $paths.Add($path) }
+    }
+
+    @($paths | Select-Object -Unique)
+}
+
+function Get-LiongardEvents {
+    param([datetime]$StartTime)
+
+    $events = @()
+    try {
+        $events += @(Get-WinEvent -FilterHashtable @{
+                LogName   = 'LiongardAgentLog'
+                StartTime = $StartTime
+                Level     = 2, 3
+            } -ErrorAction Stop)
+    }
+    catch {
+        if ($_.Exception.Message -notmatch 'No events were found|does not exist') {
+            $script:CollectionWarnings.Add("LiongardAgentLog query failed: $($_.Exception.Message)")
+        }
+    }
+
+    try {
+        $applicationEvents = Get-WinEvent -FilterHashtable @{
+            LogName   = 'Application'
+            StartTime = $StartTime
+            Level     = 2, 3
+        } -ErrorAction Stop | Where-Object {
+            $_.ProviderName -match 'Liongard|Roar' -or $_.Message -match 'Liongard|roaragent'
+        }
+        $events += @($applicationEvents)
+    }
+    catch {
+        if ($_.Exception.Message -notmatch 'No events were found') {
+            $script:CollectionWarnings.Add("Application event query failed: $($_.Exception.Message)")
+        }
+    }
+
+    @($events | Sort-Object TimeCreated -Descending)
+}
+
+function Wait-LiongardInitialization {
+    param(
+        [int]$TimeoutSeconds,
+        [int]$IntervalSeconds,
+        [string[]]$ExplicitLogPaths
+    )
+
+    $started = Get-Date
+    $deadline = $started.AddSeconds($TimeoutSeconds)
+    do {
+        $svc = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+            Where-Object { (Get-LiongardServiceNames) -contains $_.Name } |
+            Select-Object -First 1
+        $exe = Resolve-ServiceExecutablePath -Service $svc
+        $paths = Get-CandidateLogPaths -ExplicitPaths $ExplicitLogPaths -ExecutablePath $exe
+        $folder = $paths | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | Select-Object -First 1
+        $file = if ($folder) {
+            Get-ChildItem -LiteralPath $folder -File -Recurse -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1
+        }
+        $process = @(Get-Process -Name (Get-LiongardProcessNames) -ErrorAction SilentlyContinue)
+
+        if ($svc -and $svc.State -eq 'Running' -and ($svc.ProcessId -gt 0 -or $process.Count -gt 0) -and $file) {
+            return [pscustomobject]@{
+                Completed = $true
+                WaitedSeconds = [math]::Round(((Get-Date) - $started).TotalSeconds)
+            }
+        }
+        if ((Get-Date) -lt $deadline) { Start-Sleep -Seconds $IntervalSeconds }
+    } while ((Get-Date) -lt $deadline)
+
+    [pscustomobject]@{
+        Completed = $false
+        WaitedSeconds = [math]::Round(((Get-Date) - $started).TotalSeconds)
+    }
+}
+
+function Get-ServiceRecoveryConfiguration {
+    param([string]$ServiceName)
+
+    if ([string]::IsNullOrWhiteSpace($ServiceName)) {
+        return [pscustomobject]@{ Available = $false; RestartConfigured = $false; Detail = 'No service.' }
+    }
+
+    try {
+        $output = & sc.exe qfailure $ServiceName 2>&1
+        $text = $output -join [Environment]::NewLine
+        $restartConfigured = $text -match 'RESTART\s+--'
+        [pscustomobject]@{ Available = $true; RestartConfigured = $restartConfigured; Detail = ($text -replace '\s+', ' ').Trim() }
+    }
+    catch {
+        [pscustomobject]@{ Available = $false; RestartConfigured = $false; Detail = $_.Exception.Message }
+    }
+}
+
+function Get-PendingRebootReasons {
+    $reasons = New-Object System.Collections.Generic.List[string]
+    foreach ($path in @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+        )) {
+        if (Test-Path -LiteralPath $path) { $reasons.Add($path) }
+    }
+
+    try {
+        $pendingRename = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+        if ($pendingRename) { $reasons.Add('PendingFileRenameOperations') }
+    }
+    catch { }
+
+    try {
+        $activeName = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -Name ComputerName -ErrorAction Stop).ComputerName
+        $targetName = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -Name ComputerName -ErrorAction Stop).ComputerName
+        if ($activeName -ne $targetName) { $reasons.Add('PendingComputerRename') }
+    }
+    catch { }
+
+    $reasons.ToArray()
+}
+
+function Get-TimeSyncHealth {
+    try {
+        $output = & w32tm.exe /query /status 2>&1
+        $text = $output -join [Environment]::NewLine
+        $source = if ($text -match '(?im)^Source:\s*(?<value>.+)$') { $Matches['value'].Trim() } else { $null }
+        $lastSync = if ($text -match '(?im)^Last Successful Sync Time:\s*(?<value>.+)$') {
+            ConvertTo-DateTimeOffsetOrNull -Value $Matches['value'].Trim()
+        } else { $null }
+        [pscustomobject]@{ Available = $LASTEXITCODE -eq 0; Source = $source; LastSync = $lastSync; Detail = ($text -replace '\s+', ' ').Trim() }
+    }
+    catch {
+        [pscustomobject]@{ Available = $false; Source = $null; LastSync = $null; Detail = $_.Exception.Message }
+    }
+}
+
+function Get-ProcessResourceSample {
+    param(
+        [string[]]$Names,
+        [int]$Count,
+        [int]$IntervalSeconds
+    )
+
+    $samples = New-Object System.Collections.Generic.List[object]
+    $previous = @{}
+    for ($index = 0; $index -lt $Count; $index++) {
+        $capturedAt = Get-Date
+        foreach ($process in @(Get-Process -Name $Names -ErrorAction SilentlyContinue)) {
+            $cpuPercent = $null
+            $key = [string]$process.Id
+            if ($previous.ContainsKey($key)) {
+                $elapsed = ($capturedAt - $previous[$key].CapturedAt).TotalSeconds
+                $cpuDelta = $process.TotalProcessorTime.TotalSeconds - $previous[$key].CpuSeconds
+                if ($elapsed -gt 0) {
+                    $cpuPercent = [math]::Round(($cpuDelta / ($elapsed * [Environment]::ProcessorCount)) * 100, 1)
+                }
+            }
+            $samples.Add([pscustomobject]@{
+                    Id = $process.Id
+                    Name = $process.ProcessName
+                    CpuPercent = $cpuPercent
+                    MemoryMB = [math]::Round($process.WorkingSet64 / 1MB, 1)
+                })
+            $previous[$key] = [pscustomobject]@{ CapturedAt = $capturedAt; CpuSeconds = $process.TotalProcessorTime.TotalSeconds }
+        }
+        if ($index -lt ($Count - 1)) { Start-Sleep -Seconds $IntervalSeconds }
+    }
+    $samples.ToArray()
+}
+
+function Get-RecentLogErrorSummary {
+    param(
+        [string[]]$Paths,
+        [datetime]$Since
+    )
+
+    $patterns = @{
+        Authentication = 'auth|unauthori[sz]ed|forbidden|access denied|token'
+        Certificate    = 'cert|certificate|signature|signed'
+        Connectivity   = 'connect|timeout|timed out|dns|socket|network|tls|ssl'
+        Upload         = 'upload|heartbeat|check.?in|submit|send'
+    }
+    $counts = @{}
+    foreach ($name in $patterns.Keys) { $counts[$name] = 0 }
+
+    $files = @(
+        Get-ChildItem -LiteralPath $Paths -File -Recurse -ErrorAction SilentlyContinue |
+        Where-Object LastWriteTime -ge $Since |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 20
+    )
+    foreach ($file in $files) {
+        foreach ($line in @(Get-Content -LiteralPath $file.FullName -Tail 2000 -ErrorAction SilentlyContinue)) {
+            if ($line -notmatch 'error|fail|exception|warn|denied|timeout|invalid') { continue }
+            foreach ($name in $patterns.Keys) {
+                if ($line -match $patterns[$name]) { $counts[$name]++ }
+            }
+        }
+    }
+
+    [pscustomobject]@{
+        FilesRead = $files.Count
+        Authentication = $counts.Authentication
+        Certificate = $counts.Certificate
+        Connectivity = $counts.Connectivity
+        Upload = $counts.Upload
+        TotalClassified = ($counts.Values | Measure-Object -Sum).Sum
+    }
+}
+
+$initialization = [pscustomobject]@{ Completed = $null; WaitedSeconds = 0 }
+if ($WaitForInitialization) {
+    $initialization = Wait-LiongardInitialization -TimeoutSeconds $InitializationTimeoutSeconds -IntervalSeconds $PollIntervalSeconds -ExplicitLogPaths $LogPath
+}
+
+$script:CollectionWarnings = New-Object System.Collections.Generic.List[string]
+$now = Get-Date
+$checks = New-Object System.Collections.Generic.List[object]
+
+if ($WaitForInitialization) {
+    $checks.Add([pscustomobject]@{
+            Name     = 'InitializationGrace'
+            State    = if ($initialization.Completed) { 'Pass' } else { 'Fail' }
+            Detail   = "Completed=$($initialization.Completed); WaitedSeconds=$($initialization.WaitedSeconds); TimeoutSeconds=$InitializationTimeoutSeconds"
+            Required = $true
+        })
+}
+
+try {
+    $serviceCim = @(
+        Get-CimInstance -ClassName Win32_Service |
+        Where-Object { (Get-LiongardServiceNames) -contains $_.Name }
+    )
+}
+catch {
+    $serviceCim = @()
+    $script:CollectionWarnings.Add("Service query failed: $($_.Exception.Message)")
+}
+
+$service = $serviceCim | Sort-Object @{ Expression = { if ($_.State -eq 'Running') { 0 } else { 1 } } } | Select-Object -First 1
+$serviceFound = $null -ne $service
+$serviceRunning = $serviceFound -and $service.State -eq 'Running'
+
+$checks.Add([pscustomobject]@{
+        Name     = 'ServiceInstalled'
+        State    = if ($serviceFound) { 'Pass' } else { 'Fail' }
+        Detail   = if ($serviceFound) { "$($service.Name) ($($service.DisplayName))" } else { 'No known Liongard service found.' }
+        Required = $true
+    })
+$checks.Add([pscustomobject]@{
+        Name     = 'ServiceRunning'
+        State    = if ($serviceRunning) { 'Pass' } elseif ($serviceFound) { 'Fail' } else { 'Unknown' }
+        Detail   = if ($serviceFound) { "State=$($service.State); StartMode=$($service.StartMode)" } else { 'Cannot evaluate without a service.' }
+        Required = $true
+    })
+
+$automaticStart = $serviceFound -and $service.StartMode -eq 'Auto'
+$checks.Add([pscustomobject]@{
+        Name     = 'ServiceAutomaticStart'
+        State    = if ($automaticStart) { 'Pass' } elseif ($serviceFound) { 'Fail' } else { 'Unknown' }
+        Detail   = if ($serviceFound) { "StartMode=$($service.StartMode)" } else { 'Cannot evaluate without a service.' }
+        Required = $false
+    })
+
+$recovery = Get-ServiceRecoveryConfiguration -ServiceName $(if ($serviceFound) { $service.Name } else { $null })
+$checks.Add([pscustomobject]@{
+        Name     = 'ServiceRecoveryConfigured'
+        State    = if ($recovery.Available -and $recovery.RestartConfigured) { 'Pass' } elseif ($recovery.Available) { 'Fail' } else { 'Unknown' }
+        Detail   = $recovery.Detail
+        Required = $false
+    })
+
+$processes = @()
+try {
+    $processes = @(Get-Process -Name (Get-LiongardProcessNames) -ErrorAction SilentlyContinue)
+}
+catch {
+    $script:CollectionWarnings.Add("Process query failed: $($_.Exception.Message)")
+}
+
+$serviceProcessId = if ($serviceFound) { [int](Get-PropertyValue -InputObject $service -Name 'ProcessId' -Default 0) } else { 0 }
+$processRunning = $processes.Count -gt 0 -or $serviceProcessId -gt 0
+$checks.Add([pscustomobject]@{
+        Name     = 'ProcessRunning'
+        State    = if ($processRunning) { 'Pass' } elseif ($serviceFound) { 'Fail' } else { 'Unknown' }
+        Detail   = if ($processRunning) { "PIDs=$((@($processes.Id) + @($serviceProcessId) | Where-Object { $_ -gt 0 } | Select-Object -Unique) -join ',')" } else { 'No known Liongard process found.' }
+        Required = $true
+    })
+
+$resourceSamples = Get-ProcessResourceSample -Names (Get-LiongardProcessNames) -Count $ResourceSampleCount -IntervalSeconds $ResourceSampleIntervalSeconds
+$cpuValues = @($resourceSamples | Where-Object { $null -ne $_.CpuPercent } | Select-Object -ExpandProperty CpuPercent)
+$memoryValues = @($resourceSamples | Select-Object -ExpandProperty MemoryMB)
+$averageCpu = if ($cpuValues.Count -gt 0) { [math]::Round(($cpuValues | Measure-Object -Average).Average, 1) } else { $null }
+$maximumMemory = if ($memoryValues.Count -gt 0) { [math]::Round(($memoryValues | Measure-Object -Maximum).Maximum, 1) } else { $null }
+$resourceExcessive = ($null -ne $averageCpu -and $averageCpu -gt $MaximumAverageCpuPercent) -or
+    ($null -ne $maximumMemory -and $maximumMemory -gt $MaximumProcessMemoryMB)
+$checks.Add([pscustomobject]@{
+        Name     = 'ProcessResourceUsage'
+        State    = if (-not $processRunning) { 'Unknown' } elseif ($resourceExcessive) { 'Fail' } else { 'Pass' }
+        Detail   = "AverageCpuPercent=$averageCpu; MaximumMemoryMB=$maximumMemory; CpuThreshold=$MaximumAverageCpuPercent; MemoryThresholdMB=$MaximumProcessMemoryMB; Samples=$($resourceSamples.Count)"
+        Required = $false
+    })
+
+$executablePath = Resolve-ServiceExecutablePath -Service $service
+$signatureStatus = 'Unknown'
+$signatureSigner = $null
+if ($executablePath -and (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
+    try {
+        $signature = Get-AuthenticodeSignature -LiteralPath $executablePath
+        $signatureStatus = [string]$signature.Status
+        if ($signature.SignerCertificate) { $signatureSigner = $signature.SignerCertificate.Subject }
+    }
+    catch {
+        $script:CollectionWarnings.Add("Signature check failed: $($_.Exception.Message)")
+    }
+}
+$checks.Add([pscustomobject]@{
+        Name     = 'ExecutableSignature'
+        State    = if ($signatureStatus -eq 'Valid') { 'Pass' } elseif ($signatureStatus -eq 'Unknown') { 'Unknown' } else { 'Fail' }
+        Detail   = "Path=$executablePath; Status=$signatureStatus; Signer=$signatureSigner"
+        Required = $false
+    })
+
+$agentVersion = Get-LiongardInstalledVersion
+if (-not $agentVersion -and $executablePath -and (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
+    $agentVersion = (Get-Item -LiteralPath $executablePath).VersionInfo.ProductVersion
+}
+$versionState = if (-not $agentVersion) {
+    'Unknown'
+}
+elseif ([string]::IsNullOrWhiteSpace($ApprovedAgentVersion)) {
+    'Pass'
+}
+else {
+    try {
+        if ([version]$agentVersion -eq [version]$ApprovedAgentVersion) { 'Pass' } else { 'Fail' }
+    }
+    catch {
+        if ($agentVersion -eq $ApprovedAgentVersion) { 'Pass' } else { 'Fail' }
+    }
+}
+$checks.Add([pscustomobject]@{
+        Name     = 'AgentVersionCompliance'
+        State    = $versionState
+        Detail   = "Installed=$agentVersion; Approved=$(if ($ApprovedAgentVersion) { $ApprovedAgentVersion } else { 'NotEnforced' })"
+        Required = $false
+    })
+
+$requiredFiles = @($RequiredFilePath)
+if ($executablePath) { $requiredFiles += $executablePath }
+$fileEvidence = foreach ($path in ($requiredFiles | Where-Object { $_ } | Select-Object -Unique)) {
+    $exists = Test-Path -LiteralPath $path -PathType Leaf
+    $status = if ($exists) { [string](Get-AuthenticodeSignature -LiteralPath $path).Status } else { 'Missing' }
+    [pscustomobject]@{ Path = $path; Exists = $exists; Signature = $status }
+}
+$badFiles = @($fileEvidence | Where-Object { -not $_.Exists -or $_.Signature -ne 'Valid' })
+$checks.Add([pscustomobject]@{
+        Name     = 'RequiredFilesSigned'
+        State    = if ($fileEvidence.Count -eq 0) { 'Unknown' } elseif ($badFiles.Count -gt 0) { 'Fail' } else { 'Pass' }
+        Detail   = (($fileEvidence | ForEach-Object { "$($_.Path)=$($_.Signature)" }) -join '; ')
+        Required = $false
+    })
+
+$disk = $null
+if ($executablePath) {
+    try {
+        $root = [IO.Path]::GetPathRoot($executablePath)
+        $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($root.TrimEnd('\'))'" -ErrorAction Stop
+    }
+    catch {
+        $script:CollectionWarnings.Add("Disk query failed: $($_.Exception.Message)")
+    }
+}
+$freeDiskMB = if ($disk) { [math]::Round($disk.FreeSpace / 1MB, 1) } else { $null }
+$freeDiskPercent = if ($disk -and $disk.Size -gt 0) { [math]::Round(($disk.FreeSpace / $disk.Size) * 100, 1) } else { $null }
+$diskHealthy = $disk -and $freeDiskMB -ge $MinimumFreeDiskMB -and $freeDiskPercent -ge $MinimumFreeDiskPercent
+$checks.Add([pscustomobject]@{
+        Name     = 'DiskSpace'
+        State    = if (-not $disk) { 'Unknown' } elseif ($diskHealthy) { 'Pass' } else { 'Fail' }
+        Detail   = "FreeMB=$freeDiskMB; FreePercent=$freeDiskPercent; MinimumMB=$MinimumFreeDiskMB; MinimumPercent=$MinimumFreeDiskPercent"
+        Required = $false
+    })
+
+$candidateLogPaths = Get-CandidateLogPaths -ExplicitPaths $LogPath -ExecutablePath $executablePath
+$existingLogPaths = @($candidateLogPaths | Where-Object { Test-Path -LiteralPath $_ -PathType Container })
+$newestLog = $null
+if ($existingLogPaths.Count -gt 0) {
+    try {
+        $newestLog = Get-ChildItem -LiteralPath $existingLogPaths -File -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+    }
+    catch {
+        $script:CollectionWarnings.Add("Log enumeration failed: $($_.Exception.Message)")
+    }
+}
+
+$logAgeMinutes = if ($newestLog) { [math]::Round(($now - $newestLog.LastWriteTime).TotalMinutes, 1) } else { $null }
+$logRecent = $newestLog -and $logAgeMinutes -le $MaximumLogAgeMinutes
+$checks.Add([pscustomobject]@{
+        Name     = 'LogFolderExists'
+        State    = if ($existingLogPaths.Count -gt 0) { 'Pass' } else { 'Fail' }
+        Detail   = if ($existingLogPaths.Count -gt 0) { $existingLogPaths -join '; ' } else { "Checked: $($candidateLogPaths -join '; ')" }
+        Required = $true
+    })
+$checks.Add([pscustomobject]@{
+        Name     = 'LogActivityRecent'
+        State    = if ($logRecent) { 'Pass' } elseif ($newestLog) { 'Fail' } else { 'Unknown' }
+        Detail   = if ($newestLog) { "Newest=$($newestLog.FullName); LastWrite=$($newestLog.LastWriteTime.ToString('o')); AgeMinutes=$logAgeMinutes; Threshold=$MaximumLogAgeMinutes" } else { 'No agent log file found.' }
+        Required = $true
+    })
+
+$logFolderSizeMB = $null
+if ($existingLogPaths.Count -gt 0) {
+    $logLength = (
+        Get-ChildItem -LiteralPath $existingLogPaths -File -Recurse -ErrorAction SilentlyContinue |
+        Measure-Object Length -Sum
+    ).Sum
+    if ($null -eq $logLength) { $logLength = 0 }
+    $logFolderSizeMB = [math]::Round($logLength / 1MB, 1)
+}
+$checks.Add([pscustomobject]@{
+        Name     = 'LogFolderSize'
+        State    = if ($null -eq $logFolderSizeMB) { 'Unknown' } elseif ($logFolderSizeMB -le $MaximumLogFolderMB) { 'Pass' } else { 'Fail' }
+        Detail   = "SizeMB=$logFolderSizeMB; MaximumMB=$MaximumLogFolderMB"
+        Required = $false
+    })
+
+$logWritable = $null
+$logWriteDetail = 'No log folder available.'
+$isElevated = Test-IsElevated
+if ($existingLogPaths.Count -gt 0 -and -not $isElevated) {
+    $logWriteDetail = 'Write probe skipped because the health script is not elevated; RMM should run it as SYSTEM.'
+}
+elseif ($existingLogPaths.Count -gt 0) {
+    $probePath = Join-Path $existingLogPaths[0] ('.liongard-health-{0}.tmp' -f [guid]::NewGuid().Guid)
+    try {
+        [IO.File]::WriteAllText($probePath, '')
+        Remove-Item -LiteralPath $probePath -Force -ErrorAction Stop
+        $logWritable = $true
+        $logWriteDetail = "Write/delete probe succeeded in $($existingLogPaths[0])."
+    }
+    catch {
+        $logWritable = $false
+        $logWriteDetail = $_.Exception.Message
+        Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+    }
+}
+$checks.Add([pscustomobject]@{
+        Name     = 'LogFolderWritable'
+        State    = if ($null -eq $logWritable) { 'Unknown' } elseif ($logWritable) { 'Pass' } else { 'Fail' }
+        Detail   = $logWriteDetail
+        Required = $false
+    })
+
+$logErrors = if ($existingLogPaths.Count -gt 0) {
+    Get-RecentLogErrorSummary -Paths $existingLogPaths -Since $now.AddHours(-$EventLookbackHours)
+}
+else {
+    [pscustomobject]@{ FilesRead = 0; Authentication = 0; Certificate = 0; Connectivity = 0; Upload = 0; TotalClassified = 0 }
+}
+$recurringErrors = $logErrors.TotalClassified -ge $RecurringLogErrorThreshold
+$checks.Add([pscustomobject]@{
+        Name     = 'RecurringAgentLogErrors'
+        State    = if ($logErrors.FilesRead -eq 0) { 'Unknown' } elseif ($recurringErrors) { 'Fail' } else { 'Pass' }
+        Detail   = "FilesRead=$($logErrors.FilesRead); Authentication=$($logErrors.Authentication); Certificate=$($logErrors.Certificate); Connectivity=$($logErrors.Connectivity); Upload=$($logErrors.Upload); Threshold=$RecurringLogErrorThreshold"
+        Required = $false
+    })
+
+$events = Get-LiongardEvents -StartTime $now.AddHours(-$EventLookbackHours)
+$signatureEvents = @($events | Where-Object { $_.Message -match 'sign|signature|certificate|cert' })
+$processStartEvents = @($events | Where-Object { $_.Message -match 'process.+not.+start|failed.+start|cannot.+start' })
+$checks.Add([pscustomobject]@{
+        Name     = 'RecentCriticalEvents'
+        State    = if ($signatureEvents.Count -gt 0 -or $processStartEvents.Count -gt 0) { 'Fail' } elseif ($events.Count -gt 0) { 'Warn' } else { 'Pass' }
+        Detail   = "WarningsOrErrors=$($events.Count); SignatureRelated=$($signatureEvents.Count); ProcessStartRelated=$($processStartEvents.Count); LookbackHours=$EventLookbackHours"
+        Required = $false
+    })
+
+$serviceStabilityEvents = @()
+if ($serviceFound) {
+    try {
+        $serviceStabilityEvents = @(
+            Get-WinEvent -FilterHashtable @{
+                LogName = 'System'
+                ProviderName = 'Service Control Manager'
+                Id = 7031, 7034
+                StartTime = $now.AddHours(-$EventLookbackHours)
+            } -ErrorAction Stop | Where-Object { $_.Message -match [regex]::Escape($service.DisplayName) -or $_.Message -match [regex]::Escape($service.Name) }
+        )
+    }
+    catch {
+        if ($_.Exception.Message -notmatch 'No events were found') {
+            $script:CollectionWarnings.Add("Service stability event query failed: $($_.Exception.Message)")
+        }
+    }
+}
+$checks.Add([pscustomobject]@{
+        Name     = 'ServiceStability'
+        State    = if (-not $serviceFound) { 'Unknown' } elseif ($serviceStabilityEvents.Count -gt 0) { 'Fail' } else { 'Pass' }
+        Detail   = "UnexpectedTerminationEvents=$($serviceStabilityEvents.Count); LookbackHours=$EventLookbackHours"
+        Required = $false
+    })
+
+$timeSync = Get-TimeSyncHealth
+$timeSyncAgeHours = if ($timeSync.LastSync) { [math]::Round(([DateTimeOffset]::UtcNow - $timeSync.LastSync).TotalHours, 1) } else { $null }
+$timeHealthy = $timeSync.Available -and $timeSync.Source -and $timeSync.Source -notmatch 'Local CMOS Clock|Free-running' -and
+    ($null -eq $timeSyncAgeHours -or $timeSyncAgeHours -le $MaximumTimeSyncAgeHours)
+$checks.Add([pscustomobject]@{
+        Name     = 'WindowsTimeSynchronized'
+        State    = if ($timeHealthy) { 'Pass' } else { 'Fail' }
+        Detail   = "Source=$($timeSync.Source); LastSync=$($timeSync.LastSync); AgeHours=$timeSyncAgeHours; MaximumAgeHours=$MaximumTimeSyncAgeHours"
+        Required = $false
+    })
+
+$pendingRebootReasons = @(Get-PendingRebootReasons)
+$checks.Add([pscustomobject]@{
+        Name     = 'PendingReboot'
+        State    = if ($pendingRebootReasons.Count -eq 0) { 'Pass' } else { 'Warn' }
+        Detail   = if ($pendingRebootReasons.Count -eq 0) { 'No pending reboot indicators found.' } else { $pendingRebootReasons -join '; ' }
+        Required = $false
+    })
+
+$machineGuid = Get-LocalMachineGuid
+$platformLookup = Get-LiongardPlatformAgent -Prefix $InstancePrefix -Key $ApiTokenKey -Secret $ApiTokenSecret -MachineGuid $machineGuid
+$platformAgentCount = @($platformLookup.Agents).Count
+$platformHeartbeat = $null
+if ($platformAgentCount -gt 0) {
+    $platformHeartbeat = @($platformLookup.Agents | ForEach-Object { Get-LiongardAgentHeartbeatTime -Agent $_ } | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1)[0]
+}
+$platformHeartbeatAgeHours = if ($platformHeartbeat) { [math]::Round(([DateTimeOffset]::UtcNow - $platformHeartbeat).TotalHours, 1) } else { $null }
+$platformFresh = $platformHeartbeat -and $platformHeartbeatAgeHours -le $PlatformHeartbeatFreshHours
+$localHealthySignal = $serviceRunning -and $processRunning -and $logRecent
+$platformState = if (-not $platformLookup.Attempted) {
+    'NotConfigured'
+}
+elseif ($platformLookup.Error) {
+    'LookupFailed'
+}
+elseif ($platformAgentCount -eq 0) {
+    'NoMatch'
+}
+elseif ($platformAgentCount -gt 1) {
+    'DuplicateMatches'
+}
+elseif ($platformFresh) {
+    'Fresh'
+}
+else {
+    'Stale'
+}
+$disagreement = ($platformLookup.Attempted -and -not $platformLookup.Error -and
+    (($localHealthySignal -and -not $platformFresh) -or (-not $localHealthySignal -and $platformFresh)))
+$checks.Add([pscustomobject]@{
+        Name     = 'LocalPlatformHeartbeatAgreement'
+        State    = if (-not $platformLookup.Attempted) { 'Pass' } elseif ($platformLookup.Error) { 'Unknown' } elseif ($disagreement -or $platformState -in @('NoMatch', 'DuplicateMatches')) { 'Fail' } else { 'Pass' }
+        Detail   = "LocalHealthy=$localHealthySignal; PlatformState=$platformState; Matches=$platformAgentCount; Heartbeat=$platformHeartbeat; AgeHours=$platformHeartbeatAgeHours; FreshThresholdHours=$PlatformHeartbeatFreshHours; Error=$($platformLookup.Error)"
+        Required = $false
+    })
+
+$requiredFailures = @($checks | Where-Object { $_.Required -and $_.State -eq 'Fail' })
+$allFailures = @($checks | Where-Object State -eq 'Fail')
+$unknownChecks = @($checks | Where-Object State -eq 'Unknown')
+$warningChecks = @($checks | Where-Object State -eq 'Warn')
+
+if (-not $serviceFound) {
+    $status = 'UNKNOWN'
+    $exitCode = 3
+}
+elseif ($requiredFailures.Count -gt 0) {
+    $status = 'UNHEALTHY'
+    $exitCode = 2
+}
+elseif ($allFailures.Count -gt 0 -or $unknownChecks.Count -gt 0 -or $warningChecks.Count -gt 0 -or $script:CollectionWarnings.Count -gt 0) {
+    $status = 'DEGRADED'
+    $exitCode = 1
+}
+else {
+    $status = 'HEALTHY'
+    $exitCode = 0
+}
+
+$result = [pscustomobject]@{
+    ComputerName       = $env:COMPUTERNAME
+    CheckedAt          = $now.ToString('o')
+    Status             = $status
+    ExitCode           = $exitCode
+    ServiceName        = if ($serviceFound) { $service.Name } else { $null }
+    ServiceState       = if ($serviceFound) { $service.State } else { $null }
+    ServiceStartMode   = if ($serviceFound) { $service.StartMode } else { $null }
+    InitializationWaitedSeconds = $initialization.WaitedSeconds
+    ProcessIds         = @(@($processes.Id) + @($serviceProcessId) | Where-Object { $_ -gt 0 } | Select-Object -Unique)
+    AgentVersion       = $agentVersion
+    ApprovedAgentVersion = $ApprovedAgentVersion
+    AverageCpuPercent  = $averageCpu
+    MaximumMemoryMB    = $maximumMemory
+    ExecutablePath     = $executablePath
+    SignatureStatus    = $signatureStatus
+    SignatureSigner    = $signatureSigner
+    LogPaths           = $existingLogPaths
+    NewestLogFile      = if ($newestLog) { $newestLog.FullName } else { $null }
+    NewestLogWriteTime = if ($newestLog) { $newestLog.LastWriteTime.ToString('o') } else { $null }
+    NewestLogAgeMinutes = $logAgeMinutes
+    LogFolderSizeMB    = $logFolderSizeMB
+    LogErrors          = $logErrors
+    FreeDiskMB         = $freeDiskMB
+    FreeDiskPercent    = $freeDiskPercent
+    PendingRebootReasons = $pendingRebootReasons
+    TimeSource         = $timeSync.Source
+    LastTimeSync       = $timeSync.LastSync
+    MachineGuid        = $machineGuid
+    PlatformState      = $platformState
+    PlatformHeartbeat  = $platformHeartbeat
+    PlatformHeartbeatAgeHours = $platformHeartbeatAgeHours
+    RecentEventCount   = $events.Count
+    RecentEvents       = @($events | Select-Object -First 10 TimeCreated, Id, LevelDisplayName, ProviderName, Message)
+    Checks             = $checks.ToArray()
+    CollectionWarnings = $script:CollectionWarnings.ToArray()
+}
+
+$failedNames = @($checks | Where-Object { $_.State -in @('Fail', 'Warn', 'Unknown') } | ForEach-Object Name)
+Write-Output ("RMM_RESULT={0}; Service={1}; ProcessRunning={2}; Version={3}; LogAgeMinutes={4}; Signature={5}; Platform={6}; Events={7}; Flags={8}" -f
+    $status,
+    $(if ($serviceFound) { "$($service.Name):$($service.State)" } else { 'NotFound' }),
+    $processRunning,
+    $(if ($agentVersion) { $agentVersion } else { 'Unknown' }),
+    $(if ($null -ne $logAgeMinutes) { $logAgeMinutes } else { 'N/A' }),
+    $signatureStatus,
+    $platformState,
+    $events.Count,
+    $(if ($failedNames.Count -gt 0) { $failedNames -join ',' } else { 'None' }))
+
+foreach ($check in $checks) {
+    Write-Verbose ("[{0}] {1}: {2}" -f $check.State, $check.Name, $check.Detail)
+}
+foreach ($warning in $script:CollectionWarnings) {
+    Write-Warning $warning
+}
+if ($Json) {
+    $result | ConvertTo-Json -Depth 7 -Compress
+}
+
+exit $exitCode
