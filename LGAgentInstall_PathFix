@@ -56,9 +56,9 @@
 # Only an agent install token is required to install/register the Liongard Agent. API tokens
 # are NOT required for the base install — see the optional API-backed section further below.
 # ============================================================
-$InstancePrefix          = "us3.app.liongard.com"     # Liongard instance prefix (e.g. us1, us2, eu1)
-$AgentTokenKey           = "cfc3ed21c91f2b64635d"     # Liongard agent install key
-$AgentTokenSecret        = "0191221a425280a64abd79512f4b8d8cd33f03726265707b4227e80abb0b75db"  # Liongard agent install secret
+$InstancePrefix          = ""     # Liongard instance prefix (e.g. us1, us2, eu1)
+$AgentTokenKey           = ""     # Liongard agent install key
+$AgentTokenSecret        = ""  # Liongard agent install secret
 $Environment             = "@EnvironmentName@"    # Environment name (can be an RMM variable); required only when $IncludeEnvironmentValue = $true
 
 # ============================================================
@@ -77,8 +77,8 @@ $IncludeEnvironmentValue = $true     # Set to $false to omit the environment val
 # ============================================================
 $EnableEnvironmentNameMatching     = $false   # $true => resolve/normalize $Environment to the exact Liongard environment name via the API
 $EnableEnvironmentDeviceValidation = $false   # $true => run the read-only environment/device validation advisory via the API
-$ApiTokenKey             = "357c330f896648d7967c"       # Liongard API token key    (required only when an API-backed feature above is enabled)
-$ApiTokenSecret          = "e12a8190d9a981fcce333b5f7908440fb5ed871ee70b4e9b0e9f1c5847544ff2"    # Liongard API token secret (required only when an API-backed feature above is enabled)
+$ApiTokenKey             = ""       # Liongard API token key    (required only when an API-backed feature above is enabled)
+$ApiTokenSecret          = ""    # Liongard API token secret (required only when an API-backed feature above is enabled)
 
 # ============================================================
 # Advanced Defaults - Do Not Change Unless Directed by Liongard Support
