@@ -1,0 +1,2939 @@
+#requires -Version 5.1
+<#
+    Liongard Agent deployment script that:
+      • Validates partner-supplied config values.
+      • Resolves the target Liongard environment name via the API.
+      • Downloads the MSI installer and compares its version against any currently installed agent.
+      • Installs the agent when no prior installation is found, or upgrades it when the downloaded
+        version is strictly newer than what is installed.
+      • Summarizes the result using AgentInstall.log plus transcript logging.
+
+    Written by David Chapman, Manager of Partner Support.
+
+    ------------------------------------------------------------------------------------------
+    PHASE 7 ADDITION - PowerShell PATH integrity check and repair
+    ------------------------------------------------------------------------------------------
+    Addresses the agent-side failure:
+
+        exec: "powershell": executable file not found in %PATH%
+
+    That string is emitted by Go's exec.LookPath, i.e. by roaragent.exe -- not by msiexec and not
+    by PowerShell. The agent shells out to PowerShell to run inspections; when the machine PATH or
+    PATHEXT is damaged, LookPath fails and the agent installs "successfully" but never produces
+    usable data.
+
+    Three distinct root causes are detected and repaired, because fixing only the first is why
+    manual PATH edits often appear not to work:
+
+      1. Path does not contain %SystemRoot%\System32\WindowsPowerShell\v1.0\ (or System32 itself).
+      2. PATHEXT is missing / does not contain .EXE. LookPath is called with the BARE name
+         "powershell", so it appends PATHEXT entries to find the binary. A perfect Path with a
+         broken PATHEXT fails identically.
+      3. The Path registry value's type was changed from REG_EXPAND_SZ to REG_SZ (commonly by
+         [Environment]::SetEnvironmentVariable(...,'Machine') or a badly written script). The
+         %SystemRoot% tokens are then never expanded and every tokenized directory is unusable.
+
+    Service-context caveat, and how it is handled:
+      The Service Control Manager snapshots the environment block at boot. Repairing machine PATH
+      therefore does NOT reach an already-running service until a reboot -- which is why manual
+      fixes "don't take". To avoid requiring a reboot, this script also writes a fully expanded
+      Path= entry into the agent service's own REG_MULTI_SZ Environment value
+      (HKLM\SYSTEM\CurrentControlSet\Services\<service>\Environment), which SCM merges into the
+      service process at start, then restarts the service.
+
+    Everything in Phase 7 is ADDITIVE:
+      • PATH entries are only ever appended, never removed or reordered.
+      • The original Path/PATHEXT raw values are backed up to $Folder before any write.
+      • Existing service Environment entries other than Path= are preserved.
+      • Default behavior on an unrepairable machine is to WARN and continue, matching the
+        advisory-by-default posture used by Phase 6 ($FailOnEnvironmentMismatch).
+      • No existing decision, exit code, or code path was removed or altered.
+#>
+
+# ============================================================
+# Partner Configuration - Required
+# Replace every REPLACE_WITH_* value before deploying.
+# Only an agent install token is required to install/register the Liongard Agent. API tokens
+# are NOT required for the base install — see the optional API-backed section further below.
+# ============================================================
+$InstancePrefix          = ""     # Liongard instance prefix (e.g. us1, us2, eu1)
+$AgentTokenKey           = ""     # Liongard agent install key
+$AgentTokenSecret        = ""  # Liongard agent install secret
+$Environment             = "@EnvironmentName@"    # Environment name (can be an RMM variable); required only when $IncludeEnvironmentValue = $true
+
+# ============================================================
+# Partner Configuration - Optional
+# ============================================================
+$AgentDescription        = ""        # Optional agent description shown in Liongard
+$IncludeEnvironmentValue = $true     # Set to $false to omit the environment value
+
+# ============================================================
+# Partner Configuration - Optional API-backed matching / validation
+# These advanced features call the Liongard API and therefore REQUIRE API tokens. Both default
+# to $false so the base agent install needs only the agent install token above. Enable one or
+# both only when you intentionally want API-backed environment lookup or device validation
+# (advanced partners / Liongard Support). When both are $false the script makes no API calls and
+# API tokens are not required.
+# ============================================================
+$EnableEnvironmentNameMatching     = $false   # $true => resolve/normalize $Environment to the exact Liongard environment name via the API
+$EnableEnvironmentDeviceValidation = $false   # $true => run the read-only environment/device validation advisory via the API
+$ApiTokenKey             = ""       # Liongard API token key    (required only when an API-backed feature above is enabled)
+$ApiTokenSecret          = ""    # Liongard API token secret (required only when an API-backed feature above is enabled)
+
+# ============================================================
+# Advanced Defaults - Do Not Change Unless Directed by Liongard Support
+# ============================================================
+# Installer source / location.
+$Folder       = "C:\Liongard"
+$InstallerUrl = "https://agents.static.liongard.com/LiongardAgent-lts.msi"
+
+# Discovery safety: this MSI script is the STANDARD, non-scanning agent path. It NEVER installs
+# Npcap or the Visual C++ redistributable and NEVER enables network discovery. This guard detects
+# discovery/scanning settings accidentally copy-pasted in from the EXE script.
+#   $false -> warn only and continue normally.
+#   $true  -> abort with config-validation code 11 if discovery settings are detected.
+$BlockDiscoverySettings = $false
+
+# Update-safe parameter policy. Fresh installs pass the full property set; in-place UPDATES
+# withhold registration/configuration properties so a version-only update cannot move/overwrite
+# the agent's URL, keys, name, environment, or description. Set $true ONLY if Support directs it.
+$ReassertInstallParametersOnUpdate = $false
+
+# Advisory environment/device validation (read-only). $true blocks a HIGH-confidence
+# wrong-environment match before install/update (exit 11). A full MachineGuid match scores 100;
+# do not lower the threshold for blocking.
+$FailOnEnvironmentMismatch = $false
+$EnvironmentValidationHighConfidenceThreshold = 100
+
+# ============================================================
+# Phase 7 - PowerShell PATH integrity check / repair
+# Targets: exec: "powershell": executable file not found in %PATH%
+# All repairs are additive. See the header block for the full rationale.
+# ============================================================
+# Master switch for the whole phase. $false => detection and repair are both skipped entirely.
+$EnablePowerShellPathCheck = $true
+
+# $true  -> repair the machine Path (append missing directories, restore REG_EXPAND_SZ type).
+# $false -> DETECT AND REPORT ONLY. Useful for a fleet-wide audit pass before changing anything.
+$RepairPowerShellPath = $true
+
+# $true -> repair PATHEXT when it is missing or does not contain .EXE. Required for Go's
+# exec.LookPath("powershell") to resolve the bare name.
+$RepairPathExt = $true
+
+# $true -> write Path= into the agent service's REG_MULTI_SZ Environment value so the fix applies
+# on the next service start WITHOUT waiting for a reboot. Other Environment entries are preserved.
+$ApplyServiceEnvironmentOverride = $true
+
+# $true -> restart the Liongard agent service after a successful PATH repair so it picks up the
+# corrected environment immediately.
+$RestartAgentServiceAfterPathRepair = $true
+
+# $true -> broadcast WM_SETTINGCHANGE so Explorer and newly launched processes pick up the change.
+# Non-fatal if the P/Invoke cannot be compiled on a locked-down host.
+$BroadcastEnvironmentChange = $true
+
+# $true -> additionally strip empty entries and stray quotes from the machine Path while repairing.
+# Defaults to $false: the safe default only APPENDS and never rewrites existing entries.
+$NormalizeMachinePathEntries = $false
+
+# $true -> after resolving powershell.exe, launch it once to confirm it actually executes. This is
+# what separates "not on PATH" from "on PATH but blocked by ThreatLocker / SentinelOne / AppLocker",
+# which are otherwise indistinguishable in the agent's error output.
+$TestPowerShellExecution = $true
+
+# $true -> abort the run with exit code 44 when PowerShell cannot be resolved and cannot be
+# repaired. Default $false = warn and continue (advisory), matching $FailOnEnvironmentMismatch.
+$FailOnPowerShellPathUnrepairable = $false
+
+# $true -> when a repair was applied but could NOT be delivered to the service without a reboot,
+# escalate a successful exit 0 to exit 2 ('Success, reboot required'). Default $false so existing
+# exit-code behavior is unchanged unless you opt in.
+$EscalateExitCodeWhenPathRepairNeedsReboot = $false
+
+# Expanded machine Path length at which truncation risk is reported. Values at or above this are
+# a common root cause in their own right: the tail of Path silently stops being honored.
+$MachinePathLengthWarningThreshold = 2047
+
+# ================================
+# Functions
+# ================================
+
+function Assert-ConfigurationValue {
+    param(
+        [string]$Name,
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value) -or $Value -like 'REPLACE_WITH_*') {
+        throw "Configuration value [$Name] must be provided before running this script."
+    }
+}
+
+# ================================
+# Phase 1 - Read-only detection & reporting helpers
+# These functions only READ local state (registry, services, CIM, DNS). They never
+# modify the system and are used solely for richer logging and the run summary.
+# ================================
+function Get-IsElevated {
+    # Reports whether the current context is elevated (Administrator) or SYSTEM.
+    # Read-only: the result is logged but does NOT change any behavior in this phase.
+    try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
+        return [bool]$principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-LocalDeviceIdentity {
+    # Collects local machine identifiers for reporting and future device matching.
+    # Mirrors the identifier logic used by the uninstall script. Never throws.
+    $machineGuid = $null
+    try {
+        $cryptoPath = 'HKLM:\SOFTWARE\Microsoft\Cryptography'
+        if (Test-Path -LiteralPath $cryptoPath) {
+            $value = (Get-ItemProperty -LiteralPath $cryptoPath -Name 'MachineGuid' -ErrorAction SilentlyContinue).MachineGuid
+            if (-not [string]::IsNullOrWhiteSpace($value)) { $machineGuid = $value.Trim() }
+        }
+    }
+    catch { }
+
+    $hardwareUuid = $null
+    try {
+        $uuid = (Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction Stop).UUID
+        if (-not [string]::IsNullOrWhiteSpace($uuid) -and
+            $uuid -notmatch '^(00000000-0000-0000-0000-000000000000|FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF)$') {
+            $hardwareUuid = $uuid.Trim()
+        }
+    }
+    catch { }
+
+    $netbios = $env:COMPUTERNAME
+    $hostName = $null
+    try { $hostName = [System.Net.Dns]::GetHostName() } catch { }
+
+    $fqdn = $null
+    try {
+        $resolved = [System.Net.Dns]::GetHostEntry('localhost').HostName
+        if (-not [string]::IsNullOrWhiteSpace($resolved)) { $fqdn = $resolved }
+    }
+    catch { }
+
+    $macAddresses = New-Object System.Collections.Generic.List[string]
+    try {
+        $adapters = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True" -ErrorAction Stop
+        foreach ($adapter in $adapters) {
+            if (-not [string]::IsNullOrWhiteSpace($adapter.MACAddress)) {
+                $macAddresses.Add($adapter.MACAddress) | Out-Null
+            }
+        }
+    }
+    catch { }
+
+    return [pscustomobject]@{
+        MachineGuid  = $machineGuid
+        HardwareUuid = $hardwareUuid
+        NetbiosName  = $netbios
+        Hostname     = $hostName
+        Fqdn         = $fqdn
+        MacAddresses = @($macAddresses | Select-Object -Unique)
+    }
+}
+
+function ConvertTo-SafeArray {
+    # Build-safe collection -> object[]. On Windows PowerShell 5.1 (e.g. 5.1.20348) the array
+    # subexpression @() over a System.Collections.Generic.List throws "Argument types do not
+    # match" when $ErrorActionPreference = 'Stop'. Routing through the pipeline avoids it, so
+    # every "@($collection)" site is funneled through here.
+    param([Parameter()] $Value)
+    if ($null -eq $Value) { return @() }
+    return @($Value | Write-Output)
+}
+function Get-ServiceSafe {
+    # Resilient wrapper around Get-Service. On some hosts (e.g. machines with per-user service
+    # instances such as CDPUserSvc_*/OneSyncSvc_*) Get-Service can raise a TERMINATING .NET
+    # exception ("Argument types do not match") while the Service Control Manager enumerates
+    # services -- which -ErrorAction (non-terminating only) does NOT trap. These service checks
+    # are read-only/idempotent and must never abort the run, so a failure degrades to $null
+    # (treated the same as "service not present"; registry/CIM signals remain authoritative).
+    param([Parameter(Mandatory)][string]$Name)
+    try {
+        return Get-Service -Name $Name -ErrorAction SilentlyContinue
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-LiongardServiceHealth {
+    # Returns the status of each known Liongard service name that is present on the host.
+    $statuses = New-Object System.Collections.Generic.List[object]
+    foreach ($svcName in (Get-LiongardServiceNames | Select-Object -Unique)) {
+        $svc = Get-ServiceSafe -Name $svcName
+        if ($svc) {
+            $statuses.Add([pscustomobject]@{ Name = $svcName; Status = [string]$svc.Status }) | Out-Null
+        }
+    }
+    return (ConvertTo-SafeArray $statuses)
+}
+
+function Test-LiongardAgentRegistryPresent {
+    # True if a Liongard Agent uninstall entry is present in either registry view. Uses a
+    # ProductCode-agnostic scan (DisplayName / Publisher, plus the legacy product code as a fallback
+    # candidate), so a modern agent that registers under a different product code is still detected.
+    return (@(Get-LiongardUninstallMatches).Count -gt 0)
+}
+
+function Get-LiongardDetectionSnapshot {
+    # Classifies the local agent state for reporting only. Distinguishes registry-present
+    # from service-present, and running from stopped. Does NOT change any behavior.
+    $registryPresent = Test-LiongardAgentRegistryPresent
+    $services = @(Get-LiongardServiceHealth)
+    $servicePresent = ($services.Count -gt 0)
+    $running = (@($services | Where-Object { $_.Status -eq 'Running' }).Count -gt 0)
+
+    $state =
+        if ($registryPresent -and $servicePresent -and $running) { 'InstalledServiceRunning' }
+        elseif ($registryPresent -and $servicePresent) { 'InstalledServiceStopped' }
+        elseif ($registryPresent -and -not $servicePresent) { 'InstalledServiceMissing' }
+        elseif (-not $registryPresent -and $servicePresent) { 'ServicePresentRegistryMissing' }
+        else { 'NotDetected' }
+
+    return [pscustomobject]@{
+        RegistryPresent = $registryPresent
+        ServicePresent  = $servicePresent
+        ServiceRunning  = $running
+        Services        = $services
+        State           = $state
+    }
+}
+
+function Test-LiongardAgentInstalled {
+    # ProductCode-agnostic presence check (uninstall entry by DisplayName/Publisher/legacy code, OR
+    # service, OR install folder). Delegates to Get-LiongardAgentInstallInfo so detection no longer
+    # depends solely on the legacy product code {1D89F069-...}.
+    return [bool](Get-LiongardAgentInstallInfo).Installed
+}
+
+function Get-InstalledAgentVersion {
+    # Reads the DisplayVersion of the installed Liongard Agent from the uninstall
+    # registry keys. Returns a [version] object, or $null if the agent is not found
+    # or the version string cannot be parsed.
+    $uninstallPaths = @(
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{1D89F069-B48B-4191-8810-2364C29EC039}',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\{1D89F069-B48B-4191-8810-2364C29EC039}'
+    )
+
+    foreach ($path in $uninstallPaths) {
+        if (Test-Path -LiteralPath $path) {
+            $ver = (Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue).DisplayVersion
+            if (-not [string]::IsNullOrWhiteSpace($ver)) {
+                try { return [version]$ver } catch { }
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-LiongardUninstallMatches {
+    # ProductCode-agnostic scan of the Windows Installer uninstall hives (machine + WOW6432Node) for
+    # the Liongard Agent. Matches on DisplayName (Liongard / Roar Agent) or Publisher (Liongard), and
+    # always includes the known legacy product code as a fallback candidate. Read-only; never throws;
+    # uses NO Win32_Product (which can trigger MSI repair/reconfigure). Returns an array of matches
+    # with DisplayName / DisplayVersion / parsed Version / Publisher / ProductCode / KeyPath /
+    # MatchMethod / IsLegacyCode.
+    $legacyCode = '{1D89F069-B48B-4191-8810-2364C29EC039}'
+    $roots = @(
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $keys = $null
+        try { $keys = Get-ChildItem -LiteralPath $root -ErrorAction Stop } catch { continue }
+        foreach ($k in $keys) {
+            $props = $null
+            try { $props = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction Stop } catch { continue }
+            $dn  = [string]$props.DisplayName
+            $pub = [string]$props.Publisher
+            $keyName = $k.PSChildName
+
+            $isLegacy  = ($keyName -eq $legacyCode)
+            $nameMatch = ($dn -match '(?i)(liongard|roar)\s*agent' -or $dn -match '(?i)\bliongard\b')
+            $pubMatch  = ($pub -match '(?i)liongard')
+            if (-not ($nameMatch -or $pubMatch -or $isLegacy)) { continue }
+
+            $ver = $null
+            if (-not [string]::IsNullOrWhiteSpace($props.DisplayVersion)) {
+                try { $ver = [version]([string]$props.DisplayVersion).Trim() } catch { }
+            }
+
+            $method = if ($nameMatch) { 'DisplayName' } elseif ($pubMatch) { 'Publisher' } else { 'LegacyProductCode' }
+            $results.Add([pscustomobject]@{
+                DisplayName    = $dn
+                DisplayVersion = $props.DisplayVersion
+                Version        = $ver
+                Publisher      = $pub
+                ProductCode    = $keyName
+                KeyPath        = $k.PSPath
+                MatchMethod    = $method
+                IsLegacyCode   = $isLegacy
+            }) | Out-Null
+        }
+    }
+    return $results.ToArray()
+}
+
+function Get-LiongardAgentInstallInfo {
+    # Stable, ProductCode-agnostic detection of the installed Liongard Agent and its version. The old
+    # behavior read DisplayVersion from ONLY the legacy product code {1D89F069-...}; modern agents
+    # register under different product codes (e.g. the MSI {9E287513-...} and the EXE bundle
+    # {E43B859D-...}), so that single-code read silently failed and the version gate fell through to
+    # an unnecessary update. This helper uses multiple reliable signals (registry/service/file reads
+    # only -- NO Win32_Product) in priority order. Never throws.
+    #
+    # Version source priority:
+    #   1. Liongard registry version value (HKLM:\SOFTWARE\[WOW6432Node\]Liongard\LiongardAgent), if a
+    #      stable value such as AgentVersion/Version/DisplayVersion is present. (Current builds store
+    #      only MachineID\AgentGuid here -- no version -- so this is best-effort/forward-looking.)
+    #   2. Uninstall-registry DisplayVersion from the highest-version Liongard/Roar match.
+    #   3. Installed executable file version (roaragent.exe / LiongardAgent.exe).
+    #   4. Legacy product code DisplayVersion -- fallback only (covered by the uninstall scan above).
+    #
+    # "Installed" is determined from uninstall entry OR service OR install folder/exe. The Liongard
+    # registry hive is deliberately NOT used to decide "installed", because MachineID\AgentGuid can
+    # survive an uninstall as an orphan and would cause a false positive.
+    $warnings = New-Object System.Collections.Generic.List[string]
+
+    # 1. Liongard registry version value (forward-looking; absent on current builds).
+    $liongardVersion = $null
+    $liongardVersionSource = $null
+    foreach ($hive in @('HKLM:\SOFTWARE\WOW6432Node\Liongard\LiongardAgent', 'HKLM:\SOFTWARE\Liongard\LiongardAgent')) {
+        if (-not (Test-Path -LiteralPath $hive)) { continue }
+        $hp = Get-ItemProperty -LiteralPath $hive -ErrorAction SilentlyContinue
+        foreach ($vn in @('AgentVersion', 'Version', 'DisplayVersion')) {
+            $raw = $hp.$vn
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                try { $liongardVersion = [version]([string]$raw).Trim(); $liongardVersionSource = "LiongardRegistry($hive\$vn)"; break } catch { }
+            }
+        }
+        if ($liongardVersion) { break }
+    }
+
+    # 2. Uninstall-registry matches (ProductCode-agnostic).
+    $uninstallMatches = @(Get-LiongardUninstallMatches)
+    $bestUninstall = $uninstallMatches | Where-Object { $_.Version } | Sort-Object Version -Descending | Select-Object -First 1
+    if (-not $bestUninstall -and $uninstallMatches.Count -gt 0) { $bestUninstall = $uninstallMatches[0] }
+
+    # 3. Executable file-version fallback.
+    $fileVersion = $null
+    $fileVersionPath = $null
+    foreach ($exe in @('C:\Program Files (x86)\LiongardInc\LiongardAgent\roaragent.exe', 'C:\Program Files (x86)\LiongardInc\LiongardAgent\LiongardAgent.exe')) {
+        if (-not (Test-Path -LiteralPath $exe)) { continue }
+        try {
+            $vi = (Get-Item -LiteralPath $exe -ErrorAction Stop).VersionInfo
+            foreach ($cand in @($vi.ProductVersion, $vi.FileVersion)) {
+                if ($cand -and ($cand -match '\d+(\.\d+){1,3}')) { try { $fileVersion = [version]$Matches[0]; $fileVersionPath = $exe; break } catch { } }
+            }
+        }
+        catch { }
+        if ($fileVersion) { break }
+    }
+
+    # Service + install-folder presence.
+    $servicePresent = $false
+    foreach ($svc in (Get-LiongardServiceNames | Select-Object -Unique)) {
+        if (Get-ServiceSafe -Name $svc) { $servicePresent = $true; break }
+    }
+    $folderPresent = $false
+    foreach ($p in @('C:\Program Files (x86)\LiongardInc\LiongardAgent\roaragent.exe', 'C:\Program Files (x86)\LiongardInc\LiongardAgent\LiongardAgent.exe', 'C:\Program Files (x86)\LiongardInc\LiongardAgent')) {
+        if (Test-Path -LiteralPath $p) { $folderPresent = $true; break }
+    }
+
+    $uninstallPresent = ($uninstallMatches.Count -gt 0)
+    $installed = ($uninstallPresent -or $servicePresent -or $folderPresent)
+
+    $methods = @()
+    if ($uninstallPresent) { $methods += 'UninstallEntry' }
+    if ($servicePresent)   { $methods += 'Service' }
+    if ($folderPresent)    { $methods += 'InstallFolder' }
+    $detectionMethod = if ($methods.Count -gt 0) { $methods -join '+' } else { 'NotDetected' }
+
+    # Resolve version + source by priority.
+    $version = $null; $versionSource = 'Unknown'; $productCode = $null; $keyPath = $null
+    if ($liongardVersion) {
+        $version = $liongardVersion; $versionSource = $liongardVersionSource
+    }
+    elseif ($bestUninstall -and $bestUninstall.Version) {
+        $version = $bestUninstall.Version
+        $versionSource = if ($bestUninstall.IsLegacyCode) { 'LegacyProductCodeDisplayVersion' } else { 'UninstallRegistryDisplayVersion' }
+    }
+    elseif ($fileVersion) {
+        $version = $fileVersion; $versionSource = "FileVersion($fileVersionPath)"
+    }
+    if ($bestUninstall) { $productCode = $bestUninstall.ProductCode; $keyPath = $bestUninstall.KeyPath }
+
+    if ($installed -and -not $version) {
+        if ($uninstallPresent) {
+            $warnings.Add('Liongard Agent is installed (uninstall entry present) but no parseable DisplayVersion/registry/file version was found; installed version treated as unknown.') | Out-Null
+        }
+        else {
+            $warnings.Add('Liongard Agent detected via service/folder only (no uninstall entry); installed version could not be determined.') | Out-Null
+        }
+    }
+
+    return [pscustomobject]@{
+        Installed        = $installed
+        Version          = $version
+        VersionSource    = $versionSource
+        DetectionMethod  = $detectionMethod
+        ProductCode      = $productCode
+        # UpgradeCode is intentionally not resolved: it is not stored in the uninstall hive, and
+        # enumerating Installer\UpgradeCodes / MSI COM is heavy and brittle in PS 5.1. Registry
+        # scanning by DisplayName/Publisher is sufficient and ProductCode-agnostic.
+        UpgradeCode      = $null
+        UninstallKeyPath = $keyPath
+        ServicePresent   = $servicePresent
+        UninstallMatches = $uninstallMatches
+        Warnings         = $warnings.ToArray()
+    }
+}
+
+function Get-MsiProductVersion {
+    # Opens the downloaded MSI via the Windows Installer COM interface and returns
+    # its ProductVersion as a [version] object, or $null on any failure.
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $db = $installer.GetType().InvokeMember(
+            'OpenDatabase', 'InvokeMethod', $null, $installer, @($Path, 0))
+        $view = $db.GetType().InvokeMember(
+            'OpenView', 'InvokeMethod', $null, $db,
+            @("SELECT Value FROM Property WHERE Property = 'ProductVersion'"))
+        $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+        $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+
+        if ($record) {
+            $ver = $record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, @(1))
+            if (-not [string]::IsNullOrWhiteSpace($ver)) {
+                return [version]$ver
+            }
+        }
+    }
+    catch {
+        Write-Warning "Unable to read ProductVersion from MSI [$Path]: $($_.Exception.Message)"
+    }
+
+    return $null
+}
+
+function Get-MsiResultText {
+    param([int]$Code)
+    switch ($Code) {
+        0     { 'Success' }
+        3010  { 'Success, restart required' }
+        1602  { 'User cancelled' }
+        1603  { 'Fatal error during installation' }
+        1618  { 'Another install in progress' }
+        1638  { 'Another version is already installed' }
+        1619  { 'Could not open installation package' }
+        1612  { 'Installation source not available' }
+        1620  { 'Could not open installation UI' }
+        1622  { 'Error opening installation log file' }
+        1625  { 'Installation forbidden by policy' }
+        default { 'Unknown / see log' }
+    }
+}
+
+function Get-LiongardServiceNames {
+    # Returns common service name variants used by the Liongard Agent.
+    return @(
+        'roaragent',
+        'roaragent.exe',
+        'LiongardAgentSVC',
+        'LiongardAgent',
+        'Liongard Agent'
+    )
+}
+
+function Read-MsiLogSummary {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int]$MaxWaitSeconds = 60
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{ Found = $false; Code = $null; Line = $null; InvalidMsg = $null }
+    }
+
+    $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
+
+    do {
+        try {
+            $logText = Get-Content -LiteralPath $Path -Encoding Unicode -Raw -ErrorAction Stop
+        }
+        catch {
+            $logText = $null
+        }
+
+        if (-not $logText) {
+            Start-Sleep -Milliseconds 400
+            continue
+        }
+
+        $code       = $null
+        $line       = $null
+        $invalidMsg = $null
+
+        $lines = $logText -split "`r?`n"
+        for ($index = $lines.Length - 1; $index -ge 0; $index--) {
+            $currentLine = $lines[$index].Trim()
+            if (-not $currentLine) { continue }
+
+            if (-not $invalidMsg -and $currentLine -match 'INVALIDMSG\s*=\s*(?<msg>.+)') {
+                $invalidMsg = $Matches['msg'].Trim()
+            }
+
+            if (-not $code) {
+                if ($currentLine -match 'MainEngineThread\s+is\s+returning\s+(?<code>\d+)') {
+                    $code = [int]$Matches['code']
+                    $line = $currentLine
+                    if ($invalidMsg) { break }
+                    continue
+                }
+
+                if ($currentLine -match 'Installation\s+success\s+or\s+error\s+status:\s+(?<code>\d+)') {
+                    $code = [int]$Matches['code']
+                    if ($invalidMsg) { break }
+                    continue
+                }
+
+                if ($currentLine -match 'Product:\s.*?--\s*(?<msg>Installation\s+(completed\s+successfully|failed)\.?)') {
+                    $line = $currentLine
+                    $code = if ($Matches['msg'] -match 'success') { 0 } else { 1603 }
+                    if ($invalidMsg) { break }
+                    continue
+                }
+            }
+        }
+
+        if ($code -ne $null -or $invalidMsg) {
+            return [pscustomobject]@{
+                Found      = ($null -ne $code)
+                Code       = $code
+                Line       = $line
+                InvalidMsg = $invalidMsg
+            }
+        }
+
+        Start-Sleep -Milliseconds 400
+    } while ((Get-Date) -lt $deadline)
+
+    return [pscustomobject]@{ Found = $false; Code = $null; Line = $null; InvalidMsg = $null }
+}
+
+$script:TranscriptStarted = $false
+$script:TranscriptPath    = $null
+$script:EnvironmentResolutionReason = $null
+
+function Start-LiongardTranscript {
+    param([Parameter(Mandatory)][string]$TargetFolder)
+
+    if (-not (Test-Path -LiteralPath $TargetFolder)) {
+        try {
+            New-Item -Path $TargetFolder -ItemType Directory -Force | Out-Null
+        }
+        catch {
+            Write-Warning "Unable to create folder [$TargetFolder] for transcript logging: $($_.Exception.Message)"
+            return
+        }
+    }
+
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $script:TranscriptPath = Join-Path -Path $TargetFolder -ChildPath ("LGAgentScript_{0}.log" -f $timestamp)
+
+    try {
+        Start-Transcript -Path $script:TranscriptPath -Force | Out-Null
+        $script:TranscriptStarted = $true
+        Write-Host "Script transcript logging enabled at [$script:TranscriptPath]."
+    }
+    catch {
+        Write-Warning "Unable to start transcript logging at [$script:TranscriptPath]: $($_.Exception.Message)"
+        $script:TranscriptPath = $null
+    }
+}
+
+function Stop-LiongardTranscript {
+    if (-not $script:TranscriptStarted) { return }
+
+    try {
+        Stop-Transcript | Out-Null
+        if ($script:TranscriptPath) {
+            Write-Host "Script transcript saved to [$script:TranscriptPath]."
+        }
+    }
+    catch {
+        Write-Warning "Failed to finalize transcript logging: $($_.Exception.Message)"
+    }
+    finally {
+        $script:TranscriptStarted = $false
+        $script:TranscriptPath    = $null
+    }
+}
+
+function Get-LiongardAuthHeader {
+    # Builds the HTTP header required to authenticate with the Liongard REST API.
+    param(
+        [string]$ApiTokenKey,
+        [string]$ApiTokenSecret
+    )
+
+    $token   = "$ApiTokenKey`:$ApiTokenSecret"
+    $bytes   = [System.Text.Encoding]::UTF8.GetBytes($token)
+    $encoded = [System.Convert]::ToBase64String($bytes)
+    return @{
+        'X-ROAR-API-KEY' = $encoded
+        'User-Agent'     = 'LiongardAgentInstaller/1.0'
+    }
+}
+
+function Mask-SecretValue {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    if ($Value.Length -le 8) { return ('*' * $Value.Length) }
+
+    $prefix = $Value.Substring(0, 4)
+    $suffix = $Value.Substring($Value.Length - 4, 4)
+    return "$prefix****$suffix"
+}
+
+function Write-ConfigurationSnapshot {
+    $apiTokensRequired = ([bool]$EnableEnvironmentNameMatching) -or ([bool]$EnableEnvironmentDeviceValidation)
+    $apiKeyDisplay    = if ([string]::IsNullOrWhiteSpace($ApiTokenKey)    -or $ApiTokenKey    -like 'REPLACE_WITH_*') { '<optional - not configured>' } else { Mask-SecretValue -Value $ApiTokenKey }
+    $apiSecretDisplay = if ([string]::IsNullOrWhiteSpace($ApiTokenSecret) -or $ApiTokenSecret -like 'REPLACE_WITH_*') { '<optional - not configured>' } else { Mask-SecretValue -Value $ApiTokenSecret }
+    Write-Host "=== Liongard Agent Config Snapshot ==="
+    Write-Host ("InstancePrefix                   : {0}" -f $InstancePrefix)
+    Write-Host ("AgentTokenKey (masked)           : {0}" -f (Mask-SecretValue -Value $AgentTokenKey))
+    Write-Host ("AgentTokenSecret (masked)        : {0}" -f (Mask-SecretValue -Value $AgentTokenSecret))
+    Write-Host ("Environment                      : {0}" -f $Environment)
+    Write-Host ("AgentDescription                 : {0}" -f $AgentDescription)
+    Write-Host ("IncludeEnvironmentValue          : {0}" -f $IncludeEnvironmentValue)
+    Write-Host ("Deployment Path                  : MSI (standard non-scanning agent path)")
+    Write-Host ("EnableEnvironmentNameMatching    : {0}" -f $EnableEnvironmentNameMatching)
+    Write-Host ("EnableEnvironmentDeviceValidation: {0}" -f $EnableEnvironmentDeviceValidation)
+    Write-Host ("API tokens required (optional)   : {0}" -f $apiTokensRequired)
+    Write-Host ("ApiTokenKey (masked)             : {0}" -f $apiKeyDisplay)
+    Write-Host ("ApiTokenSecret (masked)          : {0}" -f $apiSecretDisplay)
+    Write-Host ("Folder                           : {0}" -f $Folder)
+    Write-Host ("InstallerUrl                     : {0}" -f $InstallerUrl)
+    # Phase 7 toggles.
+    Write-Host ("EnablePowerShellPathCheck        : {0}" -f $EnablePowerShellPathCheck)
+    Write-Host ("RepairPowerShellPath (auto-fix)  : {0}" -f $RepairPowerShellPath)
+    Write-Host ("RepairPathExt                    : {0}" -f $RepairPathExt)
+    Write-Host ("ApplyServiceEnvironmentOverride  : {0}" -f $ApplyServiceEnvironmentOverride)
+    Write-Host ("RestartAgentServiceAfterRepair   : {0}" -f $RestartAgentServiceAfterPathRepair)
+    Write-Host ("FailOnPowerShellPathUnrepairable : {0}" -f $FailOnPowerShellPathUnrepairable)
+    Write-Host "======================================"
+}
+
+function Normalize-EnvironmentName {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+
+    $trimmed = $Value.Trim()
+    # Strip leading articles to improve matching when environments differ by "The/A/An".
+    $trimmed = $trimmed -replace '^(?i)\s*(the|a|an)\s+', ''
+    # Treat "&" and the standalone word "and" as equivalent.
+    $trimmed = $trimmed -replace '&', ' and '
+    $trimmed = $trimmed -replace '(?i)\band\b', ' '
+
+    # Remove diacritics before stripping punctuation to improve matching of accented names.
+    $formD = $trimmed.Normalize([Text.NormalizationForm]::FormD)
+    $chars = $formD.ToCharArray() | Where-Object {
+        [System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($_) -ne [System.Globalization.UnicodeCategory]::NonSpacingMark
+    }
+    $folded = -join $chars
+
+    $normalized = ($folded -replace '[^0-9a-zA-Z]', '').ToUpperInvariant()
+    if ([string]::IsNullOrWhiteSpace($normalized)) { return $null }
+
+    return $normalized
+}
+
+function Get-LiongardEnvironmentNameValue {
+    param($Environment)
+
+    foreach ($key in @('Name', 'DisplayName', 'EnvironmentName', 'Environment')) {
+        $prop = $Environment.PSObject.Properties[$key]
+        if ($prop -and -not [string]::IsNullOrWhiteSpace($prop.Value)) {
+            return [string]$prop.Value
+        }
+    }
+
+    return $null
+}
+
+function Get-LiongardEnvironments {
+    param(
+        [Parameter(Mandatory)][string]$InstancePrefix,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $uri = "https://$InstancePrefix.app.liongard.com/api/v1/environments"
+
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Headers $Headers -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Unable to retrieve Liongard environments: $($_.Exception.Message)"
+        return @()
+    }
+
+    if ($null -eq $response) { return @() }
+    if ($response -is [System.Array]) { return $response }
+
+    foreach ($key in @('data', 'items', 'results', 'value')) {
+        $prop = $response.PSObject.Properties[$key]
+        if ($prop -and $prop.Value) {
+            $collection = $prop.Value
+            if ($collection -is [System.Array]) { return $collection }
+            if ($collection -is [System.Collections.IEnumerable] -and -not ($collection -is [string])) {
+                return @($collection)
+            }
+            return @($collection)
+        }
+    }
+
+    return @($response)
+}
+
+function Resolve-LiongardEnvironmentName {
+    param(
+        [Parameter(Mandatory)][string]$InputName,
+        [Parameter(Mandatory)][string]$InstancePrefix,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $script:EnvironmentResolutionReason = 'Unknown'
+    $minNormalizedLength = 4
+
+    $inputNormalized = Normalize-EnvironmentName -Value $InputName
+    if (-not $inputNormalized) { return $null }
+
+    if ($inputNormalized.Length -lt $minNormalizedLength) {
+        $script:EnvironmentResolutionReason = 'TooShort'
+        Write-Warning ("Provided environment value '{0}' normalized to '{1}', which is too short to match reliably (min {2})." -f $InputName, $inputNormalized, $minNormalizedLength)
+        return $null
+    }
+
+    $environments = Get-LiongardEnvironments -InstancePrefix $InstancePrefix -Headers $Headers
+    if (-not $environments -or $environments.Count -eq 0) {
+        $script:EnvironmentResolutionReason = 'NoEnvironmentsReturned'
+        return $null
+    }
+
+    # Pass 1: exact case-insensitive match.
+    $exact = $environments |
+        Where-Object {
+            $name = Get-LiongardEnvironmentNameValue -Environment $_
+            [string]::Equals($name, $InputName, [System.StringComparison]::InvariantCultureIgnoreCase)
+        } |
+        Select-Object -First 1
+
+    if ($exact) {
+        $script:EnvironmentResolutionReason = 'ExactMatch'
+        $exactName = Get-LiongardEnvironmentNameValue -Environment $exact
+        if (-not [string]::IsNullOrWhiteSpace($exactName)) { return $exactName }
+    }
+
+    # Pre-compute normalized candidates for the remaining passes.
+    $normalizedCandidates = @()
+    foreach ($env in $environments) {
+        $name       = Get-LiongardEnvironmentNameValue -Environment $env
+        $normalized = Normalize-EnvironmentName -Value $name
+        $normalizedCandidates += [pscustomobject]@{
+            Name       = $name
+            Normalized = $normalized
+            Data       = $env
+        }
+    }
+
+    # Pass 2: full normalized match.
+    $normalizedMatches = @($normalizedCandidates | Where-Object { $_.Normalized -and $_.Normalized -eq $inputNormalized })
+    if ($normalizedMatches.Count -eq 1) {
+        $script:EnvironmentResolutionReason = 'NormalizedMatch'
+        return $normalizedMatches[0].Name
+    }
+    elseif ($normalizedMatches.Count -gt 1) {
+        $script:EnvironmentResolutionReason = 'AmbiguousNormalized'
+        $sample = ($normalizedMatches | Select-Object -First 3).Name -join '; '
+        Write-Warning ("Multiple Liongard environments match provided name '{0}' after normalization; candidates: {1}. Skipping automatic mapping." -f $InputName, $sample)
+        return $null
+    }
+
+    # Pass 3: prefix match (either side starts with the other).
+    $prefixMatches = @(
+        $normalizedCandidates | Where-Object {
+            $_.Normalized -and (
+                $_.Normalized.StartsWith($inputNormalized) -or
+                $inputNormalized.StartsWith($_.Normalized)
+            )
+        }
+    )
+
+    if ($prefixMatches.Count -eq 1) {
+        $script:EnvironmentResolutionReason = 'PrefixMatch'
+        Write-Host ("Normalized environment prefix match: '{0}' -> '{1}'" -f $InputName, $prefixMatches[0].Name)
+        return $prefixMatches[0].Name
+    }
+    elseif ($prefixMatches.Count -gt 1) {
+        $script:EnvironmentResolutionReason = 'AmbiguousPrefix'
+        $sample = ($prefixMatches | Select-Object -First 3).Name -join '; '
+        Write-Warning ("Multiple Liongard environments partially match provided name '{0}'; candidates: {1}. Skipping automatic mapping." -f $InputName, $sample)
+        return $null
+    }
+
+    # Pass 4: substring contains match. Both sides must meet the minimum length to
+    # avoid spurious hits from short environment names (e.g. "IT" matching "SMITH IT SERVICES").
+    $containsMinLength = 6
+    if ($inputNormalized.Length -ge $containsMinLength) {
+        $containsMatches = @(
+            $normalizedCandidates | Where-Object {
+                $_.Normalized -and
+                $_.Normalized.Length -ge $containsMinLength -and (
+                    $_.Normalized.Contains($inputNormalized) -or
+                    $inputNormalized.Contains($_.Normalized)
+                )
+            }
+        )
+
+        if ($containsMatches.Count -eq 1) {
+            $script:EnvironmentResolutionReason = 'ContainsMatch'
+            Write-Host ("Normalized environment contains match: '{0}' -> '{1}'" -f $InputName, $containsMatches[0].Name)
+            return $containsMatches[0].Name
+        }
+        elseif ($containsMatches.Count -gt 1) {
+            $script:EnvironmentResolutionReason = 'AmbiguousContains'
+            $sample = ($containsMatches | Select-Object -First 3).Name -join '; '
+            Write-Warning ("Multiple Liongard environments partially match provided name '{0}' (contains); candidates: {1}. Skipping automatic mapping." -f $InputName, $sample)
+            return $null
+        }
+    }
+
+    $script:EnvironmentResolutionReason = 'NoMatch'
+    $knownNames  = ($normalizedCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Name) } | Select-Object -ExpandProperty Name)
+    $sampleNames = ($knownNames | Select-Object -First 5) -join '; '
+    Write-Warning ("No Liongard environment matched provided name '{0}' (normalized '{1}'). Known environments: {2}" -f $InputName, $inputNormalized, $sampleNames)
+    return $null
+}
+
+function Resolve-InstancePrefix {
+    # Normalizes the instance input so partners can supply a short prefix, full host, or URL.
+    param([string]$Value)
+
+    $sanitized = $Value.Trim()
+    if ($sanitized -match '^https?://') {
+        $uri       = [Uri]$sanitized
+        $sanitized = $uri.Host
+    }
+
+    if ($sanitized -match '\.app\.liongard\.com$') {
+        return ($sanitized -split '\.')[0]
+    }
+
+    return $sanitized
+}
+
+function Get-LiongardInstaller {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [int]$MinimumBytes = 1048576,
+        [int]$MaxAttempts  = 3
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        if (Test-Path -LiteralPath $DestinationPath) {
+            try { Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction Stop } catch { }
+        }
+
+        Write-Host ("Downloading Liongard Agent installer (attempt {0}/{1}) to [{2}]..." -f $attempt, $MaxAttempts, $DestinationPath)
+        try {
+            Invoke-WebRequest -Uri $Uri -OutFile $DestinationPath -UseBasicParsing -ErrorAction Stop
+        }
+        catch {
+            Write-Warning "Installer download failed: $($_.Exception.Message)"
+            continue
+        }
+
+        try {
+            $file = Get-Item -LiteralPath $DestinationPath -ErrorAction Stop
+            if ($file.Length -lt $MinimumBytes) {
+                Write-Warning ("Downloaded installer size {0} bytes is below expected threshold; retrying..." -f $file.Length)
+                continue
+            }
+
+            Write-Host ("Installer download verified ({0:N0} bytes)." -f $file.Length)
+            return $true
+        }
+        catch {
+            Write-Warning "Unable to validate installer at [$DestinationPath]: $($_.Exception.Message)"
+        }
+    }
+
+    return $false
+}
+
+# ================================
+# Phase 2 - Standardized script exit codes
+# Stable codes for Intune/RMM. Separate from raw MSI codes (see Get-MsiResultText).
+# ================================
+function Get-ScriptExitCodeMeaning {
+    param([int]$Code)
+    switch ($Code) {
+        0  { 'Success' }
+        2  { 'Success, reboot required' }
+        10 { 'Not running as admin' }
+        11 { 'Configuration validation failure' }
+        20 { 'Download failure' }
+        21 { 'Installer missing or unreadable' }
+        40 { 'Install failure' }
+        41 { 'Update failure' }
+        42 { 'Dependency failure' }
+        43 { 'Partial validation failure' }
+        44 { 'PowerShell PATH unresolvable and unrepairable' }
+        50 { 'Uninstall failure' }
+        51 { 'Remote platform deletion skipped due to low confidence' }
+        1  { 'Unexpected exception' }
+        default { 'Unknown' }
+    }
+}
+
+# ================================================================================================
+# Phase 7 - PowerShell PATH integrity: detection and repair
+#
+# Target failure (emitted by the Go agent, roaragent.exe):
+#     exec: "powershell": executable file not found in %PATH%
+#
+# Go's exec.LookPath is called with the BARE name "powershell". It therefore needs BOTH:
+#   (a) a Path entry containing powershell.exe, AND
+#   (b) a PATHEXT that includes .EXE so the bare name can be extended.
+# Either one being broken produces the identical error message, which is why single-cause fixes
+# so often appear not to work.
+#
+# All functions below read first and write only what is missing. Nothing is removed or reordered.
+# ================================================================================================
+
+$script:SessionManagerEnvKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+$script:DefaultPathExt = '.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC'
+
+function Get-MachineEnvironmentValueInfo {
+    # Reads a machine-scope environment variable straight from the Session Manager hive, UNEXPANDED.
+    #
+    # Why not [Environment]::GetEnvironmentVariable(...,'Machine'): it expands tokens and hides the
+    # registry value KIND, and the kind is one of the three root causes. A Path stored as REG_SZ
+    # instead of REG_EXPAND_SZ leaves every %SystemRoot% token literal, so consumers -- including
+    # the SCM environment block handed to the agent service -- see an unusable directory string.
+    param([Parameter(Mandatory)][string]$Name)
+
+    $result = [pscustomobject]@{
+        Name            = $Name
+        Exists          = $false
+        RawValue        = $null
+        ExpandedValue   = $null
+        ValueKind       = $null
+        IsExpandable    = $false
+        ContainsTokens  = $false
+        TokenUnexpanded = $false
+        RawLength       = 0
+        ExpandedLength  = 0
+        ReadError       = $null
+    }
+
+    $key = $null
+    try {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($script:SessionManagerEnvKey, $false)
+        if ($null -eq $key) {
+            $result.ReadError = 'Session Manager Environment key could not be opened.'
+            return $result
+        }
+
+        $raw = $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($null -eq $raw) { return $result }
+
+        $result.Exists    = $true
+        $result.RawValue  = [string]$raw
+        $result.RawLength = $result.RawValue.Length
+
+        try { $result.ValueKind = [string]$key.GetValueKind($Name) } catch { }
+        $result.IsExpandable   = ($result.ValueKind -eq 'ExpandString')
+        $result.ContainsTokens = ($result.RawValue -match '%[^%]+%')
+
+        try { $result.ExpandedValue = [System.Environment]::ExpandEnvironmentVariables($result.RawValue) }
+        catch { $result.ExpandedValue = $result.RawValue }
+        $result.ExpandedLength = ([string]$result.ExpandedValue).Length
+
+        # The damaging combination: tokens present but the value is not an expandable type.
+        $result.TokenUnexpanded = ($result.ContainsTokens -and -not $result.IsExpandable)
+    }
+    catch {
+        $result.ReadError = $_.Exception.Message
+    }
+    finally {
+        if ($key) { try { $key.Close() } catch { } }
+    }
+
+    return $result
+}
+
+function Split-EnvironmentPathEntries {
+    # Splits a Path string the way a consumer would, retaining the original text of each entry so a
+    # repair can be purely additive. Also flags empty entries and quoted entries, both of which are
+    # common in hand-edited Paths.
+    param([string]$Value)
+
+    $entries = New-Object System.Collections.Generic.List[object]
+    if ([string]::IsNullOrWhiteSpace($Value)) { return (ConvertTo-SafeArray $entries) }
+
+    $ordinal = 0
+    foreach ($part in ($Value -split ';')) {
+        $ordinal++
+        $trimmed  = $part.Trim()
+        $unquoted = $trimmed.Trim('"')
+        $isEmpty  = [string]::IsNullOrWhiteSpace($unquoted)
+
+        $expanded = $null
+        if (-not $isEmpty) {
+            try { $expanded = [System.Environment]::ExpandEnvironmentVariables($unquoted) } catch { $expanded = $unquoted }
+        }
+
+        $entries.Add([pscustomobject]@{
+            Ordinal        = $ordinal
+            Raw            = $part
+            Trimmed        = $trimmed
+            Unquoted       = $unquoted
+            Expanded       = $expanded
+            IsEmpty        = $isEmpty
+            WasQuoted      = ($trimmed -ne $unquoted)
+            StillTokenized = ($null -ne $expanded -and $expanded -match '%[^%]+%')
+        }) | Out-Null
+    }
+
+    return (ConvertTo-SafeArray $entries)
+}
+
+function ConvertTo-ComparablePath {
+    # Canonical form for comparing two directory strings: expanded, unquoted, no trailing
+    # separator, case-insensitive. Used so a repair never appends a directory that is already
+    # present under a different spelling (e.g. trailing backslash, or literal vs tokenized).
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $work = $Value.Trim().Trim('"')
+    try { $work = [System.Environment]::ExpandEnvironmentVariables($work) } catch { }
+    $work = $work.TrimEnd('\', '/')
+    if ([string]::IsNullOrWhiteSpace($work)) { return $null }
+    return $work.ToUpperInvariant()
+}
+
+function Backup-MachineEnvironmentValue {
+    # Writes the pre-change raw value to $Folder before any registry write, so Support can restore
+    # the exact original string. Returns the backup file path, or $null if it could not be written.
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter()][string]$RawValue,
+        [Parameter(Mandatory)][string]$TargetFolder
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $TargetFolder)) {
+            New-Item -Path $TargetFolder -ItemType Directory -Force | Out-Null
+        }
+
+        $stamp      = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $backupPath = Join-Path -Path $TargetFolder -ChildPath ("EnvBackup_{0}_{1}.txt" -f $Name, $stamp)
+
+        $lines = New-Object System.Collections.Generic.List[string]
+        $lines.Add(("# Machine environment backup taken by LGAgentScript_MSI Phase 7")) | Out-Null
+        $lines.Add(("# Timestamp   : {0}" -f (Get-Date).ToString('o'))) | Out-Null
+        $lines.Add(("# Computer    : {0}" -f $env:COMPUTERNAME)) | Out-Null
+        $lines.Add(("# Registry key: HKLM\{0}" -f $script:SessionManagerEnvKey)) | Out-Null
+        $lines.Add(("# Value name  : {0}" -f $Name)) | Out-Null
+        $lines.Add('# Raw (unexpanded) value follows on the final line.') | Out-Null
+        $lines.Add('') | Out-Null
+        $lines.Add([string]$RawValue) | Out-Null
+
+        Set-Content -LiteralPath $backupPath -Value $lines -Encoding UTF8 -ErrorAction Stop
+        return $backupPath
+    }
+    catch {
+        Write-Warning "[PSPath] Unable to write environment backup for [$Name]: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Set-MachineEnvironmentValue {
+    # Writes a machine-scope environment value with an EXPLICIT registry value kind.
+    #
+    # Deliberately does NOT use [Environment]::SetEnvironmentVariable(...,'Machine'): that API can
+    # write the value back as REG_SZ, which is one of the root causes this phase exists to repair.
+    # Writing REG_EXPAND_SZ explicitly keeps %SystemRoot% tokens working for every consumer.
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value,
+        [Parameter()][ValidateSet('ExpandString', 'String')][string]$ValueKind = 'ExpandString'
+    )
+
+    $key = $null
+    try {
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($script:SessionManagerEnvKey, $true)
+        if ($null -eq $key) {
+            return [pscustomobject]@{ Success = $false; Error = 'Session Manager Environment key could not be opened for write.' }
+        }
+
+        $kind = if ($ValueKind -eq 'String') { [Microsoft.Win32.RegistryValueKind]::String } else { [Microsoft.Win32.RegistryValueKind]::ExpandString }
+        $key.SetValue($Name, $Value, $kind)
+        return [pscustomobject]@{ Success = $true; Error = $null }
+    }
+    catch {
+        return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message }
+    }
+    finally {
+        if ($key) { try { $key.Close() } catch { } }
+    }
+}
+
+function Send-EnvironmentChangeBroadcast {
+    # Broadcasts WM_SETTINGCHANGE("Environment") so Explorer and newly launched processes pick up
+    # the change without a logoff. Does NOT reach running services -- that is handled separately by
+    # the per-service Environment override. Entirely best-effort; never throws.
+    try {
+        if (-not ('LiongardNative.EnvBroadcast' -as [type])) {
+            Add-Type -Namespace 'LiongardNative' -Name 'EnvBroadcast' -ErrorAction Stop -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+public static extern System.IntPtr SendMessageTimeout(
+    System.IntPtr hWnd, uint Msg, System.UIntPtr wParam, string lParam,
+    uint fuFlags, uint uTimeout, out System.UIntPtr lpdwResult);
+'@
+        }
+
+        $HWND_BROADCAST   = [System.IntPtr]0xffff
+        $WM_SETTINGCHANGE = 0x1A
+        $SMTO_ABORTIFHUNG = 0x0002
+        $out = [System.UIntPtr]::Zero
+
+        [void][LiongardNative.EnvBroadcast]::SendMessageTimeout(
+            $HWND_BROADCAST, $WM_SETTINGCHANGE, [System.UIntPtr]::Zero, 'Environment',
+            $SMTO_ABORTIFHUNG, 5000, [ref]$out)
+
+        return $true
+    }
+    catch {
+        Write-Warning "[PSPath] WM_SETTINGCHANGE broadcast unavailable on this host (non-fatal): $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Resolve-ExecutableFromPathEntries {
+    # Mimics Go's exec.LookPath: walk Path entries in order, and for a bare name try each PATHEXT
+    # extension in turn. Directories whose tokens never expanded are skipped, because that is
+    # exactly what the failing consumer experiences.
+    param(
+        [Parameter(Mandatory)][string]$ExecutableName,
+        [Parameter()]$PathEntries,
+        [Parameter()][string[]]$Extensions
+    )
+
+    if (-not $PathEntries) { return $null }
+    if (-not $Extensions -or $Extensions.Count -eq 0) { $Extensions = @('.EXE') }
+
+    $hasExplicitExtension = ($ExecutableName -match '\.[^\\/.]+$')
+
+    foreach ($entry in $PathEntries) {
+        if (-not $entry) { continue }
+        if ($entry.IsEmpty) { continue }
+        if ($entry.StillTokenized) { continue }
+
+        $dir = [string]$entry.Expanded
+        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+
+        $candidates = New-Object System.Collections.Generic.List[string]
+        if ($hasExplicitExtension) { $candidates.Add($ExecutableName) | Out-Null }
+        foreach ($ext in $Extensions) {
+            if ([string]::IsNullOrWhiteSpace($ext)) { continue }
+            $candidates.Add($ExecutableName + $ext.Trim()) | Out-Null
+        }
+
+        foreach ($candidate in $candidates) {
+            $full = $null
+            try { $full = Join-Path -Path $dir -ChildPath $candidate } catch { continue }
+            if ([string]::IsNullOrWhiteSpace($full)) { continue }
+            try {
+                if (Test-Path -LiteralPath $full -PathType Leaf) {
+                    return [pscustomobject]@{ FullPath = $full; Directory = $dir; Entry = $entry }
+                }
+            }
+            catch { }
+        }
+    }
+
+    return $null
+}
+
+function Test-PowerShellExecutionProbe {
+    # Launches the resolved powershell.exe once and confirms it returns a known exit code.
+    #
+    # This is the check that separates the two failure modes the agent cannot distinguish:
+    #   - "not on PATH"            -> resolution fails (repairable here)
+    #   - "on PATH but blocked"    -> resolution succeeds, execution fails or times out, which on
+    #                                 these endpoints usually means ThreatLocker / SentinelOne /
+    #                                 AppLocker interference and needs an allow rule, not a PATH fix.
+    param(
+        [Parameter(Mandatory)][string]$ExecutablePath,
+        [int]$TimeoutMilliseconds = 20000
+    )
+
+    $result = [pscustomobject]@{
+        Attempted   = $true
+        Succeeded   = $false
+        ExitCode    = $null
+        TimedOut    = $false
+        Error       = $null
+        Interpretation = $null
+    }
+
+    $sentinel = 7
+    $proc = $null
+    try {
+        $proc = Start-Process -FilePath $ExecutablePath `
+                              -ArgumentList '-NoProfile', '-NonInteractive', '-Command', "exit $sentinel" `
+                              -WindowStyle Hidden -PassThru -ErrorAction Stop
+
+        if (-not $proc.WaitForExit($TimeoutMilliseconds)) {
+            $result.TimedOut = $true
+            try { $proc.Kill() } catch { }
+            $result.Interpretation = 'PowerShell resolved but did not exit within the timeout. Suspect application control (ThreatLocker/SentinelOne/AppLocker) or a hung profile.'
+            return $result
+        }
+
+        $result.ExitCode = $proc.ExitCode
+        if ($proc.ExitCode -eq $sentinel) {
+            $result.Succeeded = $true
+            $result.Interpretation = 'PowerShell resolved and executed normally.'
+        }
+        else {
+            $result.Interpretation = ("PowerShell resolved but returned {0} instead of the expected {1}. Suspect application control or a corrupted install." -f $proc.ExitCode, $sentinel)
+        }
+    }
+    catch {
+        $result.Error = $_.Exception.Message
+        $result.Interpretation = 'PowerShell resolved on disk but could not be launched. This is an execution block, not a PATH problem; a PATH repair will not fix it.'
+    }
+
+    return $result
+}
+
+function Get-PowerShellPathDiagnostics {
+    # IDENTIFY step. Read-only. Classifies why exec.LookPath("powershell") would fail on this host
+    # and states whether a PATH/PATHEXT repair can actually fix it.
+    param(
+        [int]$LengthWarningThreshold = 2047,
+        [bool]$RunExecutionProbe = $true
+    )
+
+    $findings = New-Object System.Collections.Generic.List[string]
+    $warnings = New-Object System.Collections.Generic.List[string]
+
+    $machinePath   = Get-MachineEnvironmentValueInfo -Name 'Path'
+    $machinePathExt = Get-MachineEnvironmentValueInfo -Name 'PATHEXT'
+
+    $machineEntries = Split-EnvironmentPathEntries -Value $machinePath.RawValue
+    $processEntries = Split-EnvironmentPathEntries -Value $env:Path
+
+    # PATHEXT as the consumer sees it. An absent machine PATHEXT still leaves the process one,
+    # but the agent service gets the machine/SCM block, so the machine value is authoritative.
+    $effectivePathExtRaw = if ($machinePathExt.Exists -and -not [string]::IsNullOrWhiteSpace($machinePathExt.ExpandedValue)) {
+        [string]$machinePathExt.ExpandedValue
+    } elseif (-not [string]::IsNullOrWhiteSpace($env:PATHEXT)) {
+        [string]$env:PATHEXT
+    } else { '' }
+
+    $pathExtEntries = @()
+    if (-not [string]::IsNullOrWhiteSpace($effectivePathExtRaw)) {
+        $pathExtEntries = @($effectivePathExtRaw -split ';' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    }
+    $pathExtHasExe = (@($pathExtEntries | Where-Object { $_.ToUpperInvariant() -eq '.EXE' }).Count -gt 0)
+
+    # Is the binary physically present, regardless of PATH? This is what decides repairable vs not.
+    $expectedPsDirectory = Join-Path -Path $env:SystemRoot -ChildPath 'System32\WindowsPowerShell\v1.0'
+    $expectedPsBinary    = Join-Path -Path $expectedPsDirectory -ChildPath 'powershell.exe'
+    $binaryOnDisk        = $false
+    try { $binaryOnDisk = Test-Path -LiteralPath $expectedPsBinary -PathType Leaf } catch { }
+
+    # Resolve as the SERVICE would (machine Path) and as this process would.
+    $extensionsForLookup = if ($pathExtHasExe) { $pathExtEntries } else { @('.EXE') }
+    $machineResolution = Resolve-ExecutableFromPathEntries -ExecutableName 'powershell' -PathEntries $machineEntries -Extensions $extensionsForLookup
+    $processResolution = Resolve-ExecutableFromPathEntries -ExecutableName 'powershell' -PathEntries $processEntries -Extensions $extensionsForLookup
+
+    # --- Root cause classification -------------------------------------------------------------
+    if (-not $machinePath.Exists) {
+        $findings.Add('MachinePathMissing') | Out-Null
+    }
+    elseif ([string]::IsNullOrWhiteSpace($machinePath.RawValue)) {
+        $findings.Add('MachinePathEmpty') | Out-Null
+    }
+
+    if ($machinePath.TokenUnexpanded) {
+        $findings.Add('PathRegistryValueKindNotExpandable') | Out-Null
+        $warnings.Add(("Machine Path is stored as {0} but contains %TOKEN% references. Windows will hand consumers the literal token text, making those directories unusable." -f $machinePath.ValueKind)) | Out-Null
+    }
+
+    if ($machinePath.ExpandedLength -ge $LengthWarningThreshold) {
+        $findings.Add('MachinePathTruncationRisk') | Out-Null
+        $warnings.Add(("Expanded machine Path is {0} characters (threshold {1}). Past this length the tail of Path is commonly ignored, which silently drops whichever directories sit at the end." -f $machinePath.ExpandedLength, $LengthWarningThreshold)) | Out-Null
+    }
+
+    if (-not $pathExtHasExe) {
+        $findings.Add('PathExtMissingExe') | Out-Null
+        $warnings.Add('PATHEXT does not contain .EXE. exec.LookPath is called with the bare name "powershell" and cannot extend it, so this alone reproduces the reported error even with a perfect Path.') | Out-Null
+    }
+
+    $system32Present = $false
+    $psDirPresent    = $false
+    $wantSystem32    = ConvertTo-ComparablePath (Join-Path $env:SystemRoot 'System32')
+    $wantPsDir       = ConvertTo-ComparablePath $expectedPsDirectory
+    foreach ($entry in $machineEntries) {
+        if ($entry.IsEmpty) { continue }
+        $cmp = ConvertTo-ComparablePath $entry.Unquoted
+        if (-not $cmp) { continue }
+        if ($cmp -eq $wantSystem32) { $system32Present = $true }
+        if ($cmp -eq $wantPsDir)    { $psDirPresent = $true }
+    }
+
+    if (-not $system32Present) { $findings.Add('System32MissingFromMachinePath') | Out-Null }
+    if (-not $psDirPresent)    { $findings.Add('PowerShellDirectoryMissingFromMachinePath') | Out-Null }
+
+    if (-not $binaryOnDisk) {
+        $findings.Add('PowerShellBinaryMissingOnDisk') | Out-Null
+        $warnings.Add(("powershell.exe was not found at [{0}]. This is not a PATH problem and cannot be repaired by editing Path; the Windows PowerShell optional feature or the file itself is damaged/removed." -f $expectedPsBinary)) | Out-Null
+    }
+
+    if ($null -eq $machineResolution) { $findings.Add('UnresolvableFromMachinePath') | Out-Null }
+    if ($null -eq $processResolution) { $findings.Add('UnresolvableFromProcessPath') | Out-Null }
+
+    if ($null -ne $processResolution -and $null -eq $machineResolution) {
+        $findings.Add('ProcessPathDivergesFromMachinePath') | Out-Null
+        $warnings.Add('PowerShell resolves in this process but NOT from the machine Path. Interactive testing will look healthy while the agent service still fails, because the service is handed the machine environment.') | Out-Null
+    }
+
+    $emptyEntryCount  = @($machineEntries | Where-Object { $_.IsEmpty }).Count
+    $quotedEntryCount = @($machineEntries | Where-Object { $_.WasQuoted }).Count
+    if ($emptyEntryCount -gt 0)  { $findings.Add('MachinePathHasEmptyEntries') | Out-Null }
+    if ($quotedEntryCount -gt 0) { $findings.Add('MachinePathHasQuotedEntries') | Out-Null }
+
+    # --- Overall verdict -----------------------------------------------------------------------
+    $healthy = ($null -ne $machineResolution) -and $pathExtHasExe -and -not $machinePath.TokenUnexpanded
+
+    $repairable = $false
+    $status     = 'Unknown'
+    if ($healthy) {
+        $status = 'Healthy'
+    }
+    elseif (-not $binaryOnDisk) {
+        $status     = 'UnrepairableBinaryMissing'
+        $repairable = $false
+    }
+    else {
+        $status     = 'RepairablePathOrPathExt'
+        $repairable = $true
+    }
+
+    # --- Optional execution probe ----------------------------------------------------------------
+    $probe = $null
+    $probeTarget = $null
+    if ($machineResolution) { $probeTarget = $machineResolution.FullPath }
+    elseif ($processResolution) { $probeTarget = $processResolution.FullPath }
+    elseif ($binaryOnDisk) { $probeTarget = $expectedPsBinary }
+
+    if ($RunExecutionProbe -and $probeTarget) {
+        $probe = Test-PowerShellExecutionProbe -ExecutablePath $probeTarget
+        if (-not $probe.Succeeded) {
+            $findings.Add('PowerShellExecutionBlocked') | Out-Null
+            $warnings.Add(("powershell.exe exists at [{0}] but did not execute cleanly: {1}" -f $probeTarget, $probe.Interpretation)) | Out-Null
+            # An execution block is not fixed by a PATH repair. Say so explicitly rather than
+            # letting a "repair succeeded" line imply the device is now healthy.
+            if ($status -eq 'Healthy') { $status = 'ResolvedButExecutionBlocked'; $healthy = $false }
+        }
+    }
+
+    return [pscustomobject]@{
+        Status                  = $status
+        Healthy                 = $healthy
+        Repairable              = $repairable
+        Findings                = (ConvertTo-SafeArray $findings)
+        Warnings                = (ConvertTo-SafeArray $warnings)
+        MachinePath             = $machinePath
+        MachinePathExt          = $machinePathExt
+        MachineEntries          = $machineEntries
+        ProcessEntries          = $processEntries
+        EffectivePathExt        = $effectivePathExtRaw
+        PathExtHasExe           = $pathExtHasExe
+        PathExtEntries          = $pathExtEntries
+        ExpectedPsDirectory     = $expectedPsDirectory
+        ExpectedPsBinary        = $expectedPsBinary
+        BinaryOnDisk            = $binaryOnDisk
+        System32OnMachinePath   = $system32Present
+        PsDirectoryOnMachinePath = $psDirPresent
+        ResolvedFromMachinePath = if ($machineResolution) { $machineResolution.FullPath } else { $null }
+        ResolvedFromProcessPath = if ($processResolution) { $processResolution.FullPath } else { $null }
+        EmptyEntryCount         = $emptyEntryCount
+        QuotedEntryCount        = $quotedEntryCount
+        ExecutionProbe          = $probe
+    }
+}
+
+function Invoke-PowerShellPathRepair {
+    # REPAIR step. Purely additive:
+    #   - appends only the required directories that are genuinely absent
+    #   - rewrites the value with the correct REG_EXPAND_SZ kind when that was the fault
+    #   - repairs PATHEXT by appending .EXE (or restoring the Windows default when absent)
+    #   - backs up the original raw values to $Folder first
+    # Existing entries are never removed or reordered unless $NormalizeEntries is explicitly set.
+    param(
+        [Parameter(Mandatory)]$Diagnostics,
+        [Parameter(Mandatory)][string]$TargetFolder,
+        [bool]$RepairPath = $true,
+        [bool]$RepairPathExtValue = $true,
+        [bool]$NormalizeEntries = $false,
+        [int]$LengthWarningThreshold = 2047
+    )
+
+    $result = [pscustomobject]@{
+        Attempted          = $true
+        PathChanged        = $false
+        PathExtChanged     = $false
+        EntriesAdded       = @()
+        ValueKindCorrected = $false
+        NormalizationApplied = $false
+        PathBackupFile     = $null
+        PathExtBackupFile  = $null
+        NewMachinePathRaw  = $null
+        NewPathExt         = $null
+        Errors             = @()
+        Warnings           = @()
+    }
+
+    $errors   = New-Object System.Collections.Generic.List[string]
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $added    = New-Object System.Collections.Generic.List[string]
+
+    # Token form is used for what we append so the value stays portable across SystemRoot layouts.
+    $requiredTokens = @(
+        '%SystemRoot%\system32',
+        '%SystemRoot%',
+        '%SystemRoot%\System32\Wbem',
+        '%SystemRoot%\System32\WindowsPowerShell\v1.0\'
+    )
+    # If Path is already at the truncation threshold, only the two directories that make the agent
+    # work at all are appended. Adding the nice-to-haves would push more of the tail out of range.
+    $criticalTokens = @(
+        '%SystemRoot%\system32',
+        '%SystemRoot%\System32\WindowsPowerShell\v1.0\'
+    )
+
+    # ---------------- Path ----------------
+    if ($RepairPath) {
+        $mp = $Diagnostics.MachinePath
+
+        $result.PathBackupFile = Backup-MachineEnvironmentValue -Name 'Path' -RawValue $mp.RawValue -TargetFolder $TargetFolder
+
+        $existingComparable = New-Object System.Collections.Generic.HashSet[string]
+        foreach ($entry in $Diagnostics.MachineEntries) {
+            if ($entry.IsEmpty) { continue }
+            $cmp = ConvertTo-ComparablePath $entry.Unquoted
+            if ($cmp) { [void]$existingComparable.Add($cmp) }
+        }
+
+        $atLengthRisk = ($mp.ExpandedLength -ge $LengthWarningThreshold)
+        $tokensToConsider = if ($atLengthRisk) {
+            $warnings.Add('Machine Path is already at or beyond the truncation threshold; only the directories required for PowerShell resolution are being appended.') | Out-Null
+            $criticalTokens
+        } else { $requiredTokens }
+
+        $missingTokens = New-Object System.Collections.Generic.List[string]
+        foreach ($token in $tokensToConsider) {
+            $cmp = ConvertTo-ComparablePath $token
+            if (-not $cmp) { continue }
+            if (-not $existingComparable.Contains($cmp)) {
+                $missingTokens.Add($token) | Out-Null
+                [void]$existingComparable.Add($cmp)
+            }
+        }
+
+        # Rebuild the base value. Default keeps every original entry byte-for-byte.
+        $baseEntries = New-Object System.Collections.Generic.List[string]
+        foreach ($entry in $Diagnostics.MachineEntries) {
+            if ($NormalizeEntries) {
+                if ($entry.IsEmpty) { continue }
+                $baseEntries.Add($entry.Unquoted) | Out-Null
+            }
+            else {
+                $baseEntries.Add([string]$entry.Raw) | Out-Null
+            }
+        }
+        if ($NormalizeEntries -and ($Diagnostics.EmptyEntryCount -gt 0 -or $Diagnostics.QuotedEntryCount -gt 0)) {
+            $result.NormalizationApplied = $true
+        }
+
+        foreach ($token in $missingTokens) { $baseEntries.Add($token) | Out-Null }
+
+        $newRaw = ((ConvertTo-SafeArray $baseEntries) -join ';')
+        # Collapse only a trailing separator artifact; interior entries are untouched.
+        $newRaw = $newRaw -replace ';+$', ''
+
+        $needsKindFix  = $mp.TokenUnexpanded -or (-not $mp.IsExpandable -and $newRaw -match '%[^%]+%')
+        $needsValueFix = ($missingTokens.Count -gt 0) -or $result.NormalizationApplied
+
+        if ($needsValueFix -or $needsKindFix) {
+            $write = Set-MachineEnvironmentValue -Name 'Path' -Value $newRaw -ValueKind 'ExpandString'
+            if ($write.Success) {
+                $result.PathChanged       = $true
+                $result.NewMachinePathRaw = $newRaw
+                $result.EntriesAdded      = (ConvertTo-SafeArray $missingTokens)
+                $result.ValueKindCorrected = $needsKindFix
+                foreach ($t in $missingTokens) { $added.Add($t) | Out-Null }
+            }
+            else {
+                $errors.Add("Failed to write machine Path: $($write.Error)") | Out-Null
+            }
+        }
+    }
+
+    # ---------------- PATHEXT ----------------
+    if ($RepairPathExtValue -and -not $Diagnostics.PathExtHasExe) {
+        $pe = $Diagnostics.MachinePathExt
+        $result.PathExtBackupFile = Backup-MachineEnvironmentValue -Name 'PATHEXT' -RawValue $pe.RawValue -TargetFolder $TargetFolder
+
+        $newPathExt = $null
+        if (-not $pe.Exists -or [string]::IsNullOrWhiteSpace($pe.RawValue)) {
+            # Absent entirely: restore the Windows default set rather than inventing a minimal one.
+            $newPathExt = $script:DefaultPathExt
+        }
+        else {
+            # Present but missing .EXE: append it, keeping every existing extension and its order.
+            $newPathExt = ($pe.RawValue.TrimEnd(';') + ';.EXE')
+        }
+
+        $write = Set-MachineEnvironmentValue -Name 'PATHEXT' -Value $newPathExt -ValueKind 'String'
+        if ($write.Success) {
+            $result.PathExtChanged = $true
+            $result.NewPathExt     = $newPathExt
+        }
+        else {
+            $errors.Add("Failed to write machine PATHEXT: $($write.Error)") | Out-Null
+        }
+    }
+
+    $result.Errors   = (ConvertTo-SafeArray $errors)
+    $result.Warnings = (ConvertTo-SafeArray $warnings)
+    return $result
+}
+
+function Get-PresentLiongardServices {
+    # Resolves the known Liongard service name variants to the ACTUAL service objects present on
+    # this host. The real ServiceName (not the display name) is what indexes the registry key under
+    # HKLM\SYSTEM\CurrentControlSet\Services, so it is captured here rather than guessed.
+    $found = New-Object System.Collections.Generic.List[object]
+    $seen  = New-Object System.Collections.Generic.HashSet[string]
+
+    foreach ($candidate in (Get-LiongardServiceNames | Select-Object -Unique)) {
+        $svc = Get-ServiceSafe -Name $candidate
+        if (-not $svc) { continue }
+        $realName = [string]$svc.Name
+        if ([string]::IsNullOrWhiteSpace($realName)) { continue }
+        if (-not $seen.Add($realName.ToUpperInvariant())) { continue }
+        $found.Add([pscustomobject]@{
+            ServiceName = $realName
+            DisplayName = [string]$svc.DisplayName
+            Status      = [string]$svc.Status
+        }) | Out-Null
+    }
+
+    return (ConvertTo-SafeArray $found)
+}
+
+function Set-ServiceEnvironmentPathOverride {
+    # Writes Path=<expanded> into the service's own REG_MULTI_SZ Environment value.
+    #
+    # This is what removes the reboot requirement. The Service Control Manager snapshots the system
+    # environment block at boot, so a machine Path repair does not reach a service until the machine
+    # restarts. SCM does, however, read each service's Environment value at service start and merge
+    # it into that process. Writing a FULLY EXPANDED Path here means the agent gets a correct value
+    # on the next service start regardless of the stale SCM block.
+    #
+    # Existing Environment entries other than Path= are preserved exactly.
+    param(
+        [Parameter(Mandatory)][string]$ServiceName,
+        [Parameter(Mandatory)][string]$ExpandedPath
+    )
+
+    $key = $null
+    try {
+        $keyPath = "SYSTEM\CurrentControlSet\Services\$ServiceName"
+        $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($keyPath, $true)
+        if ($null -eq $key) {
+            return [pscustomobject]@{ Success = $false; Error = "Service key HKLM\$keyPath could not be opened for write."; PreservedEntries = 0 }
+        }
+
+        $existing = @()
+        try {
+            $raw = $key.GetValue('Environment', $null)
+            if ($raw) { $existing = @($raw) }
+        }
+        catch { }
+
+        # Keep everything that is not a Path assignment; replace any existing Path= entry.
+        $preserved = New-Object System.Collections.Generic.List[string]
+        foreach ($item in $existing) {
+            $line = [string]$item
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            if ($line -match '^\s*Path\s*=') { continue }
+            $preserved.Add($line) | Out-Null
+        }
+        $preservedCount = $preserved.Count
+
+        $preserved.Add(("Path={0}" -f $ExpandedPath)) | Out-Null
+
+        $key.SetValue('Environment', (ConvertTo-SafeArray $preserved), [Microsoft.Win32.RegistryValueKind]::MultiString)
+        return [pscustomobject]@{ Success = $true; Error = $null; PreservedEntries = $preservedCount }
+    }
+    catch {
+        return [pscustomobject]@{ Success = $false; Error = $_.Exception.Message; PreservedEntries = 0 }
+    }
+    finally {
+        if ($key) { try { $key.Close() } catch { } }
+    }
+}
+
+function Restart-LiongardAgentService {
+    # Restarts one Liongard service so it re-reads its environment. Falls back to an explicit
+    # Stop/Start pair when Restart-Service fails, which happens on agents whose worker is wedged.
+    param(
+        [Parameter(Mandatory)][string]$ServiceName,
+        [int]$StopTimeoutSeconds = 30
+    )
+
+    try {
+        Restart-Service -Name $ServiceName -Force -ErrorAction Stop
+        return [pscustomobject]@{ Success = $true; Method = 'Restart-Service'; Error = $null }
+    }
+    catch {
+        $firstError = $_.Exception.Message
+    }
+
+    try {
+        $svc = Get-ServiceSafe -Name $ServiceName
+        if ($svc -and $svc.Status -ne 'Stopped') {
+            Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+            try { $svc.WaitForStatus('Stopped', (New-TimeSpan -Seconds $StopTimeoutSeconds)) } catch { }
+        }
+        Start-Service -Name $ServiceName -ErrorAction Stop
+        return [pscustomobject]@{ Success = $true; Method = 'Stop+Start'; Error = $null }
+    }
+    catch {
+        return [pscustomobject]@{ Success = $false; Method = 'Stop+Start'; Error = ("Restart-Service failed ({0}); Stop/Start also failed ({1})." -f $firstError, $_.Exception.Message) }
+    }
+}
+
+function Invoke-LiongardServicePathMitigation {
+    # Applies the per-service Environment override and restarts the agent service so the corrected
+    # PATH takes effect without a reboot. Idempotent and safe to call more than once per run: it is
+    # invoked in Phase 7 for an already-installed agent, and again after a fresh install once the
+    # service exists.
+    param(
+        [Parameter(Mandatory)][string]$ExpandedPath,
+        [bool]$ApplyOverride = $true,
+        [bool]$RestartService = $true
+    )
+
+    $result = [pscustomobject]@{
+        ServicesFound     = 0
+        OverridesApplied  = 0
+        ServicesRestarted = 0
+        RebootStillNeeded = $false
+        Details           = @()
+        Errors            = @()
+    }
+
+    $details = New-Object System.Collections.Generic.List[object]
+    $errors  = New-Object System.Collections.Generic.List[string]
+
+    $services = @(Get-PresentLiongardServices)
+    $result.ServicesFound = $services.Count
+
+    if ($services.Count -eq 0) {
+        # Nothing installed yet. Not an error: the post-install hook calls this again.
+        $result.Details = (ConvertTo-SafeArray $details)
+        $result.Errors  = (ConvertTo-SafeArray $errors)
+        return $result
+    }
+
+    foreach ($svc in $services) {
+        $overrideApplied = $false
+        $restarted       = $false
+        $svcError        = $null
+
+        if ($ApplyOverride) {
+            $set = Set-ServiceEnvironmentPathOverride -ServiceName $svc.ServiceName -ExpandedPath $ExpandedPath
+            if ($set.Success) {
+                $overrideApplied = $true
+                $result.OverridesApplied++
+                Write-Host ("[PSPath] Service environment override written for '{0}' ({1} pre-existing entries preserved)." -f $svc.ServiceName, $set.PreservedEntries)
+            }
+            else {
+                $svcError = $set.Error
+                $errors.Add(("Service '{0}': {1}" -f $svc.ServiceName, $set.Error)) | Out-Null
+            }
+        }
+
+        if ($RestartService) {
+            $restart = Restart-LiongardAgentService -ServiceName $svc.ServiceName
+            if ($restart.Success) {
+                $restarted = $true
+                $result.ServicesRestarted++
+                Write-Host ("[PSPath] Service '{0}' restarted via {1}; corrected PATH is now in effect for the agent." -f $svc.ServiceName, $restart.Method)
+            }
+            else {
+                $errors.Add(("Service '{0}' restart failed: {1}" -f $svc.ServiceName, $restart.Error)) | Out-Null
+                Write-Warning ("[PSPath] Service '{0}' could not be restarted: {1}" -f $svc.ServiceName, $restart.Error)
+            }
+        }
+
+        # A reboot is only genuinely required when neither delivery mechanism worked: no override
+        # written AND no restart. Either one on its own gets the agent a correct PATH.
+        if (-not $overrideApplied -and -not $restarted) { $result.RebootStillNeeded = $true }
+
+        $details.Add([pscustomobject]@{
+            ServiceName     = $svc.ServiceName
+            DisplayName     = $svc.DisplayName
+            StatusBefore    = $svc.Status
+            OverrideApplied = $overrideApplied
+            Restarted       = $restarted
+            Error           = $svcError
+        }) | Out-Null
+    }
+
+    $result.Details = (ConvertTo-SafeArray $details)
+    $result.Errors  = (ConvertTo-SafeArray $errors)
+    return $result
+}
+
+function Write-PowerShellPathReport {
+    # Human-readable, greppable diagnostic block. Every line is prefixed [PSPath] so a fleet-wide
+    # sweep can be filtered out of transcripts with a single search.
+    param(
+        [Parameter(Mandatory)]$Diagnostics,
+        [Parameter()]$Repair,
+        [Parameter()]$ServiceMitigation
+    )
+
+    $d = $Diagnostics
+    Write-Host "=== PowerShell PATH Integrity (Phase 7) ==="
+    Write-Host ("[PSPath] Status                    : {0}" -f $d.Status)
+    Write-Host ("[PSPath] Healthy                   : {0}" -f $d.Healthy)
+    Write-Host ("[PSPath] Repairable                : {0}" -f $d.Repairable)
+    Write-Host ("[PSPath] Findings                  : {0}" -f $(if (@($d.Findings).Count -gt 0) { @($d.Findings) -join ', ' } else { '<none>' }))
+    Write-Host ("[PSPath] powershell.exe on disk    : {0} ({1})" -f $d.BinaryOnDisk, $d.ExpectedPsBinary)
+    Write-Host ("[PSPath] Resolved via machine Path : {0}" -f $(if ($d.ResolvedFromMachinePath) { $d.ResolvedFromMachinePath } else { '<UNRESOLVED>' }))
+    Write-Host ("[PSPath] Resolved via process Path : {0}" -f $(if ($d.ResolvedFromProcessPath) { $d.ResolvedFromProcessPath } else { '<UNRESOLVED>' }))
+    Write-Host ("[PSPath] Path registry value kind  : {0} (expandable={1}, tokens={2}, tokensBroken={3})" -f $d.MachinePath.ValueKind, $d.MachinePath.IsExpandable, $d.MachinePath.ContainsTokens, $d.MachinePath.TokenUnexpanded)
+    Write-Host ("[PSPath] Path length raw/expanded  : {0} / {1}" -f $d.MachinePath.RawLength, $d.MachinePath.ExpandedLength)
+    Write-Host ("[PSPath] System32 on machine Path  : {0}" -f $d.System32OnMachinePath)
+    Write-Host ("[PSPath] PS v1.0 dir on Path       : {0}" -f $d.PsDirectoryOnMachinePath)
+    Write-Host ("[PSPath] PATHEXT contains .EXE     : {0}" -f $d.PathExtHasExe)
+    Write-Host ("[PSPath] PATHEXT effective         : {0}" -f $(if ($d.EffectivePathExt) { $d.EffectivePathExt } else { '<empty>' }))
+    Write-Host ("[PSPath] Empty / quoted entries    : {0} / {1}" -f $d.EmptyEntryCount, $d.QuotedEntryCount)
+
+    if ($d.ExecutionProbe) {
+        Write-Host ("[PSPath] Execution probe           : succeeded={0}; exit={1}; timedOut={2}" -f $d.ExecutionProbe.Succeeded, $d.ExecutionProbe.ExitCode, $d.ExecutionProbe.TimedOut)
+        Write-Host ("[PSPath] Execution probe verdict   : {0}" -f $d.ExecutionProbe.Interpretation)
+    }
+
+    foreach ($w in @($d.Warnings)) { Write-Warning ("[PSPath] {0}" -f $w) }
+
+    if ($Repair) {
+        Write-Host ("[PSPath] Repair - Path changed     : {0}" -f $Repair.PathChanged)
+        Write-Host ("[PSPath] Repair - entries added    : {0}" -f $(if (@($Repair.EntriesAdded).Count -gt 0) { @($Repair.EntriesAdded) -join ' | ' } else { '<none>' }))
+        Write-Host ("[PSPath] Repair - value kind fixed : {0}" -f $Repair.ValueKindCorrected)
+        Write-Host ("[PSPath] Repair - PATHEXT changed  : {0}" -f $Repair.PathExtChanged)
+        Write-Host ("[PSPath] Repair - Path backup      : {0}" -f $(if ($Repair.PathBackupFile) { $Repair.PathBackupFile } else { '<none>' }))
+        Write-Host ("[PSPath] Repair - PATHEXT backup   : {0}" -f $(if ($Repair.PathExtBackupFile) { $Repair.PathExtBackupFile } else { '<none>' }))
+        foreach ($w in @($Repair.Warnings)) { Write-Warning ("[PSPath] {0}" -f $w) }
+        foreach ($e in @($Repair.Errors))   { Write-Warning ("[PSPath] Repair error: {0}" -f $e) }
+    }
+
+    if ($ServiceMitigation) {
+        Write-Host ("[PSPath] Services found            : {0}" -f $ServiceMitigation.ServicesFound)
+        Write-Host ("[PSPath] Service overrides applied : {0}" -f $ServiceMitigation.OverridesApplied)
+        Write-Host ("[PSPath] Services restarted        : {0}" -f $ServiceMitigation.ServicesRestarted)
+        Write-Host ("[PSPath] Reboot still required     : {0}" -f $ServiceMitigation.RebootStillNeeded)
+        foreach ($e in @($ServiceMitigation.Errors)) { Write-Warning ("[PSPath] Service mitigation: {0}" -f $e) }
+    }
+
+    Write-Host "==========================================="
+}
+
+function Write-MsiRunSummary {
+    # Writes a read-only JSON run summary (Phase 1; Phase 2 added exit-code fields;
+    # Phase 7 added the PowerShell PATH diagnostic fields).
+    # Idempotent: only the first call in a run writes the file.
+    param([string]$Reason)
+
+    if ($script:RunSummaryWritten) { return }
+    if ([string]::IsNullOrWhiteSpace($script:SummaryArtifactPath)) { return }
+
+    try {
+        $summary = [ordered]@{
+            scriptName                  = 'LGAgentScript_MSI'
+            scriptType                  = 'MSI install'
+            timestamp                   = (Get-Date).ToString('o')
+            computerName                = $env:COMPUTERNAME
+            executionIdentity           = ("{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME)
+            isElevated                  = $isElevated
+            machineGuid                 = if ($deviceIdentity) { $deviceIdentity.MachineGuid } else { $null }
+            hardwareUuid                = if ($deviceIdentity) { $deviceIdentity.HardwareUuid } else { $null }
+            netbiosName                 = if ($deviceIdentity) { $deviceIdentity.NetbiosName } else { $env:COMPUTERNAME }
+            hostname                    = if ($deviceIdentity) { $deviceIdentity.Hostname } else { $null }
+            fqdn                        = if ($deviceIdentity) { $deviceIdentity.Fqdn } else { $null }
+            macAddresses                = if ($deviceIdentity) { @($deviceIdentity.MacAddresses) } else { @() }
+            agentDetected               = if ($detectionSnapshot) { ($detectionSnapshot.State -ne 'NotDetected') } else { $null }
+            detectionState              = if ($detectionSnapshot) { $detectionSnapshot.State } else { $null }
+            serviceStatuses             = if ($detectionSnapshot) { @($detectionSnapshot.Services | ForEach-Object { "$($_.Name)=$($_.Status)" }) } else { @() }
+            installedVersion            = if ($installedVersion) { $installedVersion.ToString() } else { $null }
+            installedAgentDetected      = if ($installInfo) { [bool]$installInfo.Installed } else { $null }
+            installedVersionSource      = if ($installInfo) { $installInfo.VersionSource } else { $null }
+            installedDetectionMethod    = if ($installInfo) { $installInfo.DetectionMethod } else { $null }
+            installedProductCode        = if ($installInfo) { $installInfo.ProductCode } else { $null }
+            installedUpgradeCode        = if ($installInfo) { $installInfo.UpgradeCode } else { $null }
+            installedUninstallKeyPath   = if ($installInfo) { $installInfo.UninstallKeyPath } else { $null }
+            installedVersionDetectionWarnings = if ($installInfo) { @($installInfo.Warnings) } else { @() }
+            installerVersion            = if ($msiVersion) { $msiVersion.ToString() } else { $null }
+            environmentInput            = $environmentInput
+            environmentResolved         = $resolvedEnvironmentValue
+            environmentResolutionReason = $script:EnvironmentResolutionReason
+            decidedAction               = $decidedAction
+            finalStatus                 = $finalStatus
+            installerExitCode           = $exitCode
+            scriptExitCode              = $script:ScriptExitCode
+            scriptExitCodeMeaning       = if ($null -ne $script:ScriptExitCode) { Get-ScriptExitCodeMeaning -Code $script:ScriptExitCode } else { $null }
+            rawInstallerExitCode        = if ($null -ne $msiExitCode) { $msiExitCode } else { $exitCode }
+            rawInstallerExitCodeMeaning = if ($null -ne $msiExitCode) { Get-MsiResultText -Code $msiExitCode } elseif ($null -ne $exitCode) { Get-MsiResultText -Code $exitCode } else { $null }
+            rebootRequired              = ($script:ScriptExitCode -eq 2)
+            exitCodeStandardizedInPhase2 = $true
+            standardAgentPath           = $true
+            apiTokensRequired           = [bool]$apiFeatureEnabled
+            apiTokensProvided           = (-not ([string]::IsNullOrWhiteSpace($ApiTokenKey) -or $ApiTokenKey -like 'REPLACE_WITH_*'))
+            enableEnvironmentNameMatching = [bool]$EnableEnvironmentNameMatching
+            enableEnvironmentDeviceValidation = [bool]$EnableEnvironmentDeviceValidation
+            discoverySettingsDetected   = [bool]$discoverySettingsDetected
+            discoveryIndicators         = (ConvertTo-SafeArray $discoveryIndicators)
+            blockDiscoverySettings      = [bool]$BlockDiscoverySettings
+            phase3DiscoveryGuardrailsEnabled = $true
+            phase4UpdateParameterPolicyEnabled = $true
+            reassertInstallParametersOnUpdate = [bool]$ReassertInstallParametersOnUpdate
+            installParameterMode        = $installParameterMode
+            withheldRegistrationParameters = @($withheldRegistrationParameters)
+            upgradeSafeParametersUsed   = [bool]$useUpgradeSafe
+            registrationParametersReasserted = [bool]$registrationParamsReasserted
+            updateParameterPolicyNotApplicableReason = $updateParameterPolicyNotApplicableReason
+            installedVersionUnknown     = [bool]$installedVersionUnknown
+            installerVersionUnknown     = [bool]$installerVersionUnknown
+            phase6EnvironmentDeviceValidationEnabled = $true
+            failOnEnvironmentMismatch   = [bool]$FailOnEnvironmentMismatch
+            environmentValidationHighConfidenceThreshold = $EnvironmentValidationHighConfidenceThreshold
+            environmentValidationStatus = $environmentValidationStatus
+            environmentValidationStrictModeBlocked = [bool]$environmentValidationStrictModeBlocked
+            environmentValidationConfidenceScore = if ($environmentValidation) { $environmentValidation.ConfidenceScore } else { $null }
+            environmentValidationConfidenceLevel = if ($environmentValidation) { $environmentValidation.ConfidenceLevel } else { $null }
+            environmentValidationMatchedAgentId = if ($environmentValidation) { $environmentValidation.MatchedAgentId } else { $null }
+            environmentValidationMatchedAgentName = if ($environmentValidation) { $environmentValidation.MatchedAgentName } else { $null }
+            environmentValidationMatchedEnvironment = if ($environmentValidation) { $environmentValidation.MatchedEnvironment } else { $null }
+            environmentValidationExpectedEnvironment = if ($environmentValidation) { $environmentValidation.ExpectedEnvironment } else { $resolvedEnvironmentValue }
+            environmentValidationMatchSignals = if ($environmentValidation) { @($environmentValidation.MatchSignals) } else { @() }
+            environmentValidationMismatch = if ($environmentValidation) { [bool]$environmentValidation.Mismatch } else { $false }
+            environmentValidationApiAvailable = if ($environmentValidation) { [bool]$environmentValidation.ApiAvailable } else { $false }
+            environmentValidationWarnings = if ($environmentValidation) { @($environmentValidation.Warnings) } else { @() }
+
+            # ---- Phase 7: PowerShell PATH integrity -------------------------------------------
+            # These are the fields to pivot on for a fleet-wide sweep of the
+            # exec: "powershell": executable file not found in %PATH% failure.
+            phase7PowerShellPathCheckEnabled = [bool]$EnablePowerShellPathCheck
+            powerShellPathAutoRepairEnabled  = [bool]$RepairPowerShellPath
+            powerShellPathStatus             = $powerShellPathStatus
+            powerShellPathHealthy            = if ($powerShellPathDiagnostics) { [bool]$powerShellPathDiagnostics.Healthy } else { $null }
+            powerShellPathRepairable         = if ($powerShellPathDiagnostics) { [bool]$powerShellPathDiagnostics.Repairable } else { $null }
+            powerShellPathFindings           = if ($powerShellPathDiagnostics) { @($powerShellPathDiagnostics.Findings) } else { @() }
+            powerShellPathWarnings           = if ($powerShellPathDiagnostics) { @($powerShellPathDiagnostics.Warnings) } else { @() }
+            powerShellBinaryOnDisk           = if ($powerShellPathDiagnostics) { [bool]$powerShellPathDiagnostics.BinaryOnDisk } else { $null }
+            powerShellResolvedFromMachinePath = if ($powerShellPathDiagnostics) { $powerShellPathDiagnostics.ResolvedFromMachinePath } else { $null }
+            powerShellResolvedFromProcessPath = if ($powerShellPathDiagnostics) { $powerShellPathDiagnostics.ResolvedFromProcessPath } else { $null }
+            machinePathValueKind             = if ($powerShellPathDiagnostics) { $powerShellPathDiagnostics.MachinePath.ValueKind } else { $null }
+            machinePathTokensUnexpanded      = if ($powerShellPathDiagnostics) { [bool]$powerShellPathDiagnostics.MachinePath.TokenUnexpanded } else { $null }
+            machinePathExpandedLength        = if ($powerShellPathDiagnostics) { $powerShellPathDiagnostics.MachinePath.ExpandedLength } else { $null }
+            machinePathEmptyEntryCount       = if ($powerShellPathDiagnostics) { $powerShellPathDiagnostics.EmptyEntryCount } else { $null }
+            pathExtContainsExe               = if ($powerShellPathDiagnostics) { [bool]$powerShellPathDiagnostics.PathExtHasExe } else { $null }
+            pathExtEffective                 = if ($powerShellPathDiagnostics) { $powerShellPathDiagnostics.EffectivePathExt } else { $null }
+            powerShellExecutionProbeRun      = if ($powerShellExecutionProbeResult) { $true } else { $false }
+            powerShellExecutionProbeSucceeded = if ($powerShellExecutionProbeResult) { [bool]$powerShellExecutionProbeResult.Succeeded } else { $null }
+            powerShellExecutionProbeVerdict  = if ($powerShellExecutionProbeResult) { $powerShellExecutionProbeResult.Interpretation } else { $null }
+            powerShellPathRepairAttempted    = [bool]$powerShellPathRepairAttempted
+            powerShellPathRepairSucceeded    = [bool]$powerShellPathRepairSucceeded
+            powerShellPathEntriesAdded       = @($powerShellPathEntriesAdded)
+            powerShellPathValueKindCorrected = [bool]$powerShellPathValueKindCorrected
+            pathExtRepairApplied             = [bool]$pathExtRepairApplied
+            powerShellPathBackupFile         = $powerShellPathBackupFile
+            pathExtBackupFile                = $pathExtBackupFile
+            powerShellPathServiceOverrideApplied = [bool]$powerShellPathServiceOverrideApplied
+            powerShellPathServicesRestarted  = $powerShellPathServicesRestarted
+            powerShellPathRebootRecommended  = [bool]$powerShellPathRebootRecommended
+            powerShellPathPostRepairStatus   = $powerShellPathPostRepairStatus
+            failOnPowerShellPathUnrepairable = [bool]$FailOnPowerShellPathUnrepairable
+
+            summaryReason               = $Reason
+            deploymentPath              = 'MSI (standard agent path)'
+            transcriptPath              = $script:TranscriptPath
+            installerLogPath            = $logPath
+            warnings                    = (ConvertTo-SafeArray $summaryWarnings)
+        }
+
+        $summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:SummaryArtifactPath -Encoding UTF8
+        $script:RunSummaryWritten = $true
+        Write-Host "JSON run summary written to [$script:SummaryArtifactPath]."
+    }
+    catch {
+        Write-Warning "Failed to write MSI JSON run summary: $($_.Exception.Message)"
+    }
+}
+
+function Exit-MsiRun {
+    # Phase 2: single terminal helper. Records the standardized script exit code, writes the
+    # JSON summary + a final exit-summary log line, stops the transcript, and exits with the
+    # standardized code. Does NOT change install/skip decisions — only how the exit is expressed.
+    #
+    # Phase 7 addition: when a PATH repair was applied but could not be delivered to the service
+    # (no override written AND no restart), a successful exit may be escalated to 2
+    # ('Success, reboot required'). This is OPT-IN via $EscalateExitCodeWhenPathRepairNeedsReboot
+    # and defaults to off, so existing exit-code behavior is unchanged unless enabled.
+    param(
+        [Parameter(Mandatory)][int]$Code,
+        [string]$Reason
+    )
+
+    if ($EscalateExitCodeWhenPathRepairNeedsReboot -and $Code -eq 0 -and $powerShellPathRebootRecommended) {
+        Write-Warning "[PSPath] A PATH repair was applied but could not be delivered to the agent service without a reboot; escalating exit 0 -> 2 (Success, reboot required)."
+        $Code = 2
+    }
+
+    $script:ScriptExitCode = $Code
+    $meaning = Get-ScriptExitCodeMeaning -Code $Code
+    Write-MsiRunSummary -Reason $Reason
+    $rawCode = if ($null -ne $msiExitCode) { $msiExitCode } else { $exitCode }
+    Write-Host ("[Exit][SUMMARY] FinalStatus='{0}'; ScriptExitCode={1}; Meaning='{2}'; RawInstallerExitCode={3}; RebootRequired={4}" -f $finalStatus, $Code, $meaning, $rawCode, ($Code -eq 2))
+    Stop-LiongardTranscript
+    exit $Code
+}
+
+# ================================
+# Main
+# ================================
+
+# ================================
+# Phase 6 - Advisory environment / device validation (read-only, best-effort)
+# Determines whether this device already appears in Liongard and, if so, whether its agent
+# record's environment matches the one this run targets. Advisory by default; never blocks,
+# re-registers, or modifies any record. Mirrors the uninstall script's matching model.
+# ================================
+function Get-ObjectPropertyValue {
+    param([Parameter()][object]$Object, [Parameter()][string]$Name, [Parameter()][object]$Default = $null)
+    if ($null -eq $Object -or [string]::IsNullOrEmpty($Name)) { return $Default }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $Default }
+    return $property.Value
+}
+
+function Normalize-GuidString {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    return $Value.Trim('{}').Trim().ToLowerInvariant()
+}
+
+function Normalize-MacAddress {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $clean = ($Value -replace '[^0-9a-fA-F]', '').ToUpperInvariant()
+    if ($clean.Length -lt 12) { return $null }
+    return $clean.Substring(0, 12)
+}
+
+function Get-AgentHostIdentifiers {
+    param([Parameter(Mandatory)] $Agent)
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($Agent.Hostname)) { $candidates += $Agent.Hostname }
+    if (-not [string]::IsNullOrWhiteSpace($Agent.Name)) { $candidates += $Agent.Name }
+    if ($Agent.PSObject.Properties.Match('Data').Count -gt 0) {
+        $fqdn = $Agent.Data.FQDN
+        if (-not [string]::IsNullOrWhiteSpace($fqdn)) { $candidates += $fqdn }
+    }
+    $variants = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::InvariantCultureIgnoreCase)
+    foreach ($candidate in ($candidates | Sort-Object -Unique)) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+            $variants.Add($candidate) | Out-Null
+            if ($candidate.Length -gt 15) { $variants.Add($candidate.Substring(0, 15)) | Out-Null }
+        }
+    }
+    return (ConvertTo-SafeArray $variants)
+}
+
+function Get-AgentMacAddresses {
+    param($Agent)
+    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if (-not $Agent) { return $set }
+    if ($Agent.PSObject.Properties.Match('Data').Count -eq 0) { return $set }
+    $data = $Agent.Data
+    foreach ($key in @('MACAddress','MacAddress','MACAddresses','Mac','Macs')) {
+        $prop = $data.PSObject.Properties[$key]
+        if (-not $prop) { continue }
+        $raw = $prop.Value
+        if ($null -eq $raw) { continue }
+        if ($raw -is [System.Collections.IEnumerable] -and -not ($raw -is [string])) {
+            foreach ($entry in $raw) { $mac = Normalize-MacAddress -Value $entry; if ($mac) { $set.Add($mac) | Out-Null } }
+            continue
+        }
+        foreach ($part in (($raw -split '[,; ]') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+            $mac = Normalize-MacAddress -Value $part; if ($mac) { $set.Add($mac) | Out-Null }
+        }
+    }
+    return $set
+}
+
+function Get-AgentEnvironmentValue {
+    # Liongard agent records expose Environment as a nested object ({ ID, Name, ShortName, ... }).
+    # Tolerate a bare string/id too. Returns @{ Name; Id } or $null when not present.
+    param($Agent)
+    $env = Get-ObjectPropertyValue -Object $Agent -Name 'Environment'
+    if ($null -eq $env) { return $null }
+    if ($env -is [string]) {
+        if ([string]::IsNullOrWhiteSpace($env)) { return $null }
+        return [pscustomobject]@{ Name = $env; Id = $null }
+    }
+    if ($env -is [int] -or $env -is [long]) {
+        return [pscustomobject]@{ Name = $null; Id = [string]$env }
+    }
+    $name = Get-ObjectPropertyValue -Object $env -Name 'Name'
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = Get-ObjectPropertyValue -Object $env -Name 'DisplayName' }
+    $id = Get-ObjectPropertyValue -Object $env -Name 'ID'
+    if ($null -eq $id) { $id = Get-ObjectPropertyValue -Object $env -Name 'EnvironmentID' }
+    if ([string]::IsNullOrWhiteSpace($name) -and ($null -eq $id)) { return $null }
+    return [pscustomobject]@{ Name = $name; Id = $(if ($null -ne $id) { [string]$id } else { $null }) }
+}
+
+function Invoke-EnvironmentDeviceValidation {
+    # Best-effort, read-only. Queries /api/v1/agents by MachineGuid (mirrors the uninstall
+    # lookup), scores the match (MachineGuid 100, MAC +40, hostname +30), extracts the matched
+    # agent's environment, and compares it to the expected (resolved) environment. Never throws.
+    param(
+        [string]$InstancePrefix,
+        [hashtable]$Headers,
+        [Parameter(Mandatory)] $DeviceIdentity,
+        [string]$ExpectedEnvironment,
+        [int]$HighConfidenceThreshold = 100
+    )
+
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $result = [pscustomobject]@{
+        Status                 = 'Skipped'
+        ApiAvailable           = $false
+        ConfidenceScore        = 0
+        ConfidenceLevel        = 'None'
+        MatchedAgentId         = $null
+        MatchedAgentName       = $null
+        MatchedEnvironment     = $null
+        ExpectedEnvironment    = $ExpectedEnvironment
+        MatchSignals           = @()
+        Mismatch               = $false
+        HighConfidenceMismatch = $false
+        Warnings               = @()
+    }
+
+    if (-not $InstancePrefix -or -not $Headers) {
+        $warnings.Add('Liongard API context unavailable; environment/device validation skipped.') | Out-Null
+        $result.Status = 'Skipped'; $result.Warnings = (ConvertTo-SafeArray $warnings); return $result
+    }
+
+    $machineGuid = Normalize-GuidString -Value $DeviceIdentity.MachineGuid
+    if (-not $machineGuid) {
+        $warnings.Add('Local MachineGuid unavailable; advisory device match skipped (conservative).') | Out-Null
+        $result.Status = 'Skipped'; $result.Warnings = (ConvertTo-SafeArray $warnings); return $result
+    }
+
+    $escapedGuid = $DeviceIdentity.MachineGuid -replace "'", "''"
+    $encoded = [Uri]::EscapeDataString("MachineGuid = '$escapedGuid'")
+    $uri = "https://$InstancePrefix.app.liongard.com/api/v1/agents?conditions=$encoded"
+
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Headers $Headers -ErrorAction Stop
+        $result.ApiAvailable = $true
+    }
+    catch {
+        $warnings.Add("Liongard agent lookup failed (validation treated as Unavailable): $($_.Exception.Message)") | Out-Null
+        $result.Status = 'Unavailable'; $result.Warnings = (ConvertTo-SafeArray $warnings); return $result
+    }
+
+    $agents = @()
+    if ($null -ne $response) { if ($response -is [System.Array]) { $agents = $response } else { $agents = @($response) } }
+    $agents = @($agents | Where-Object { $_ })
+    if ($agents.Count -eq 0) {
+        $result.Status = 'NoLikelyMatch'; $result.Warnings = (ConvertTo-SafeArray $warnings); return $result
+    }
+
+    $localMacs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($m in @($DeviceIdentity.MacAddresses)) { $nm = Normalize-MacAddress -Value $m; if ($nm) { $localMacs.Add($nm) | Out-Null } }
+    $localNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::InvariantCultureIgnoreCase)
+    foreach ($n in @($DeviceIdentity.NetbiosName, $DeviceIdentity.Hostname, $DeviceIdentity.Fqdn)) {
+        if (-not [string]::IsNullOrWhiteSpace($n)) {
+            $localNames.Add($n) | Out-Null
+            if ($n.Length -gt 15) { $localNames.Add($n.Substring(0, 15)) | Out-Null }
+        }
+    }
+
+    $candidates = @()
+    foreach ($agent in $agents) {
+        # Verify the MachineGuid CLIENT-SIDE rather than trusting the server-side conditions filter.
+        # Only credit the 100-point MachineGuid match when the returned record's own MachineGuid
+        # matches the local one. This prevents a false high-confidence match (and a false strict-mode
+        # block) if the API ever ignores the conditions filter and returns unrelated/all agents.
+        $score = 0
+        $signals = @()
+        $agentGuid = Normalize-GuidString -Value (Get-ObjectPropertyValue -Object $agent -Name 'MachineGuid')
+        if (-not $agentGuid -and ($agent.PSObject.Properties.Match('Data').Count -gt 0)) {
+            $agentGuid = Normalize-GuidString -Value (Get-ObjectPropertyValue -Object $agent.Data -Name 'MachineGuid')
+        }
+        if ($agentGuid) {
+            if ($agentGuid -eq $machineGuid) { $score += 100; $signals += 'MachineGuid' }
+        }
+        else {
+            $warnings.Add('Agent record did not expose MachineGuid; server-side MachineGuid filter could not be verified client-side (match relies on MAC/hostname only).') | Out-Null
+        }
+        $nameMatches = @((Get-AgentHostIdentifiers -Agent $agent) | Where-Object { $localNames.Contains($_) })
+        if ($nameMatches.Count -gt 0) { $score += 30 + [Math]::Min(15, 5 * ($nameMatches.Count - 1)); $signals += 'Hostname' }
+        $macMatches = @((Get-AgentMacAddresses -Agent $agent) | Where-Object { $localMacs.Contains($_) })
+        if ($macMatches.Count -gt 0) { $score += 40 + [Math]::Min(10, 5 * ($macMatches.Count - 1)); $signals += 'MAC' }
+        $agentEnv = Get-AgentEnvironmentValue -Agent $agent
+        $candidates += [pscustomobject]@{ Agent = $agent; Score = $score; Signals = $signals; Env = $agentEnv }
+    }
+
+    # Only retain candidates with at least one client-verified signal. If the server filter was
+    # ignored and nothing matches locally, treat as no likely match (never a false block).
+    $candidates = @($candidates | Where-Object { $_.Score -gt 0 })
+    if ($candidates.Count -eq 0) {
+        $result.Status = 'NoLikelyMatch'; $result.Warnings = (ConvertTo-SafeArray $warnings); return $result
+    }
+
+    $best = ($candidates | Sort-Object Score -Descending | Select-Object -First 1)
+    $result.ConfidenceScore = $best.Score
+    $result.MatchSignals = @($best.Signals)
+    $result.MatchedAgentId = Get-ObjectPropertyValue -Object $best.Agent -Name 'ID'
+    $result.MatchedAgentName = Get-ObjectPropertyValue -Object $best.Agent -Name 'Name'
+    $result.ConfidenceLevel = if ($best.Score -ge 100) { 'High' } elseif ($best.Score -ge 70) { 'Medium' } else { 'Low' }
+
+    $bestEnv = $best.Env
+    $result.MatchedEnvironment = if ($bestEnv) { if ($bestEnv.Name) { $bestEnv.Name } elseif ($bestEnv.Id) { "ID:$($bestEnv.Id)" } else { $null } } else { $null }
+
+    if ($candidates.Count -gt 1) {
+        $distinctEnvs = @($candidates | ForEach-Object { if ($_.Env -and $_.Env.Name) { (Normalize-EnvironmentName -Value $_.Env.Name) } else { $null } } | Where-Object { $_ } | Select-Object -Unique)
+        if ($distinctEnvs.Count -gt 1) {
+            $warnings.Add(("Multiple Liongard agents matched this MachineGuid with differing environments ({0})." -f $candidates.Count)) | Out-Null
+            $result.Status = 'MultiplePossibleMatches'; $result.Warnings = (ConvertTo-SafeArray $warnings); return $result
+        }
+    }
+
+    if (-not $bestEnv -or (-not $bestEnv.Name -and -not $bestEnv.Id)) {
+        $result.Status = 'MatchedEnvironmentUnknown'; $result.Warnings = (ConvertTo-SafeArray $warnings); return $result
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedEnvironment) -or [string]::IsNullOrWhiteSpace($bestEnv.Name)) {
+        $warnings.Add('Matched-environment name comparison was not possible (expected or matched name unavailable).') | Out-Null
+        $result.Status = 'MatchedEnvironmentUnknown'; $result.Warnings = (ConvertTo-SafeArray $warnings); return $result
+    }
+
+    $expectedNorm = Normalize-EnvironmentName -Value $ExpectedEnvironment
+    $matchedNorm = Normalize-EnvironmentName -Value $bestEnv.Name
+    if ($matchedNorm -and $expectedNorm -and $matchedNorm -eq $expectedNorm) {
+        $result.Status = 'MatchedExpectedEnvironment'
+    }
+    elseif ($matchedNorm) {
+        $result.Status = 'MatchedDifferentEnvironment'
+        $result.Mismatch = $true
+        $result.HighConfidenceMismatch = ($best.Score -ge $HighConfidenceThreshold)
+    }
+    else {
+        $result.Status = 'MatchedEnvironmentUnknown'
+    }
+
+    $result.Warnings = (ConvertTo-SafeArray $warnings)
+    return $result
+}
+
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+Start-LiongardTranscript -TargetFolder $Folder
+
+# Phase 1 read-only state used by logging and the JSON run summary below. None of these
+# variables change install/update/skip decisions; they only enrich logging/reporting.
+$summaryStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$script:SummaryArtifactPath = Join-Path -Path $Folder -ChildPath ("LGAgentSummary_MSI_{0}.json" -f $summaryStamp)
+$script:RunSummaryWritten = $false
+
+$environmentInput         = $Environment
+$resolvedEnvironmentValue = $null
+$installedVersion         = $null
+$installInfo              = $null
+$msiVersion               = $null
+$exitCode                 = $null
+$msiExitCode              = $null
+$logPath                  = $null
+$decidedAction            = 'Pending'
+$finalStatus              = $null
+$deviceIdentity           = $null
+$detectionSnapshot        = $null
+$isElevated               = $null
+$script:ScriptExitCode    = $null
+$discoverySettingsDetected = $false
+$discoveryIndicators      = New-Object System.Collections.Generic.List[string]
+$summaryWarnings          = New-Object System.Collections.Generic.List[string]
+# Phase 4 update-parameter-policy state (set during the version gate / policy section).
+$agentAlreadyInstalled    = $false
+$installedVersionUnknown  = $false
+$installerVersionUnknown  = $false
+$installParameterMode     = 'NotApplicable'
+$withheldRegistrationParameters = @()
+$useUpgradeSafe           = $false
+$registrationParamsReasserted = $false
+$updateParameterPolicyNotApplicableReason = $null
+# Optional API-backed features. API tokens are required only when one of these is enabled;
+# otherwise the base install path makes no Liongard API calls and needs no API tokens.
+$apiFeatureEnabled        = ([bool]$EnableEnvironmentNameMatching) -or ([bool]$EnableEnvironmentDeviceValidation)
+# Phase 6 advisory environment/device validation state (set after environment resolution).
+$environmentValidation    = $null
+$environmentValidationStatus = 'Skipped'
+$environmentValidationStrictModeBlocked = $false
+# Phase 7 PowerShell PATH integrity state (set by the Phase 7 block below and the post-install hook).
+$powerShellPathDiagnostics           = $null
+$powerShellPathStatus                = 'NotChecked'
+$powerShellPathPostRepairStatus      = $null
+$powerShellPathRepairAttempted       = $false
+$powerShellPathRepairSucceeded       = $false
+$powerShellPathEntriesAdded          = @()
+$powerShellPathValueKindCorrected    = $false
+$pathExtRepairApplied                = $false
+$powerShellPathBackupFile            = $null
+$pathExtBackupFile                   = $null
+$powerShellPathServiceOverrideApplied = $false
+$powerShellPathServicesRestarted     = 0
+$powerShellPathRebootRecommended     = $false
+$powerShellExecutionProbeResult      = $null
+$powerShellPathCorrectedExpandedPath = $null
+$powerShellPathServiceMitigationDone  = $false
+
+# Phase 2: fail-fast elevation pre-check (SYSTEM counts as elevated; no self-elevation).
+$isElevated = Get-IsElevated
+if (-not $isElevated) {
+    Write-Error ("[Preflight][ERROR] This script must run elevated as Administrator or SYSTEM. Detected non-elevated context for user '{0}\{1}'. Aborting." -f $env:USERDOMAIN, $env:USERNAME)
+    $finalStatus = 'NotElevated'
+    Exit-MsiRun -Code 10 -Reason 'NotElevated'
+}
+
+# Validate all required configuration values. Phase 2: catch the placeholder/missing-value
+# throws so they map to the standardized config-validation exit code (11) instead of a raw
+# unhandled-exception exit. The validation behavior itself is unchanged (still aborts).
+try {
+    Assert-ConfigurationValue -Name 'InstancePrefix'   -Value $InstancePrefix
+    Assert-ConfigurationValue -Name 'AgentTokenKey'    -Value $AgentTokenKey
+    Assert-ConfigurationValue -Name 'AgentTokenSecret' -Value $AgentTokenSecret
+    if ($IncludeEnvironmentValue) {
+        Assert-ConfigurationValue -Name 'Environment' -Value $Environment
+    }
+
+    # API tokens are OPTIONAL for the base install. They are required only when an optional
+    # API-backed feature (environment name matching or environment/device validation) is enabled.
+    if ($apiFeatureEnabled) {
+        foreach ($apiToken in @(@('ApiTokenKey', $ApiTokenKey), @('ApiTokenSecret', $ApiTokenSecret))) {
+            if ([string]::IsNullOrWhiteSpace($apiToken[1]) -or $apiToken[1] -like 'REPLACE_WITH_*') {
+                throw ("Configuration value [{0}] is required because an optional API-backed feature is enabled (EnableEnvironmentNameMatching={1}, EnableEnvironmentDeviceValidation={2}). Provide valid API tokens, or set both features to `$false to install with only the agent install token." -f $apiToken[0], $EnableEnvironmentNameMatching, $EnableEnvironmentDeviceValidation)
+            }
+        }
+    }
+}
+catch {
+    Write-Error $_.Exception.Message
+    $finalStatus = 'ConfigValidationFailed'
+    Exit-MsiRun -Code 11 -Reason 'ConfigValidationFailed'
+}
+
+# Catch placeholder-style wildcard characters that Assert-ConfigurationValue does not cover.
+if ($InstancePrefix -match '[?*\[\]]') {
+    Write-Error "InstancePrefix '$InstancePrefix' contains a placeholder character. Provide a valid instance prefix (e.g. us1, eu2)."
+    $finalStatus = 'ConfigValidationFailed'
+    Exit-MsiRun -Code 11 -Reason 'InstancePrefixInvalid'
+}
+
+Write-ConfigurationSnapshot
+
+# Read-only device identity + agent detection snapshot (Phase 1). Logged for visibility
+# and the run summary only; no install/update/skip decision is changed by these values.
+$isElevated        = Get-IsElevated
+$deviceIdentity    = Get-LocalDeviceIdentity
+$detectionSnapshot = Get-LiongardDetectionSnapshot
+
+Write-Host "=== Local Device Identity (read-only) ==="
+Write-Host ("Is Elevated / SYSTEM   : {0}" -f $isElevated)
+Write-Host ("Execution Identity     : {0}\{1}" -f $env:USERDOMAIN, $env:USERNAME)
+Write-Host ("MachineGuid            : {0}" -f $deviceIdentity.MachineGuid)
+Write-Host ("Hardware UUID          : {0}" -f $deviceIdentity.HardwareUuid)
+Write-Host ("NETBIOS Name           : {0}" -f $deviceIdentity.NetbiosName)
+Write-Host ("Hostname               : {0}" -f $deviceIdentity.Hostname)
+Write-Host ("FQDN                   : {0}" -f $deviceIdentity.Fqdn)
+Write-Host ("MAC Addresses          : {0}" -f (@($deviceIdentity.MacAddresses) -join ', '))
+Write-Host "========================================="
+
+Write-Host "=== Agent Detection Snapshot (read-only) ==="
+Write-Host ("Detection State            : {0}" -f $detectionSnapshot.State)
+Write-Host ("Uninstall Registry Present : {0}" -f $detectionSnapshot.RegistryPresent)
+Write-Host ("Service Present            : {0}" -f $detectionSnapshot.ServicePresent)
+Write-Host ("Service Running            : {0}" -f $detectionSnapshot.ServiceRunning)
+Write-Host ("Service Statuses           : {0}" -f (@($detectionSnapshot.Services | ForEach-Object { "$($_.Name)=$($_.Status)" }) -join ', '))
+Write-Host ("Deployment Path            : MSI (standard agent path)")
+Write-Host ("Discovery Dependencies     : none expected on the MSI path (no Npcap / VC++ / discovery)")
+Write-Host "============================================"
+
+# Phase 3: discovery-safety guard. The MSI path is the standard, non-scanning path; it never
+# installs Npcap/VC++ or enables network discovery. Detect discovery/scanning settings that may
+# have been copy-pasted in from the EXE script (variables now; the built MSI argument list is
+# re-checked just before msiexec runs). This does NOT add any discovery functionality.
+Write-Host "=== Discovery Safety (read-only) ==="
+Write-Host "This MSI script is the STANDARD non-scanning agent path."
+Write-Host "No discovery dependencies (Npcap / Visual C++ via the discovery package) will be installed."
+Write-Host "Network discovery will NOT be enabled and network_discovery.yml will NOT be modified."
+foreach ($discoveryVar in @('DiscoveryDeviceOptIn','WhenNotDesignated','EnableNetworkDiscovery','InstallNpcap','EffectiveEnableNetworkDiscovery','EffectiveInstallNpcap')) {
+    if (Test-Path -Path ("Variable:\{0}" -f $discoveryVar)) {
+        $discoveryIndicators.Add("variable:`$$discoveryVar") | Out-Null
+    }
+}
+if ($discoveryIndicators.Count -gt 0) {
+    $discoverySettingsDetected = $true
+    Write-Warning ("Discovery/scanning settings detected in this standard MSI script: {0}. They are IGNORED here (the MSI path installs no discovery dependencies and never enables discovery). For network discovery/scanning, use the EXE script on the designated device." -f ($discoveryIndicators -join ', '))
+    if ($BlockDiscoverySettings) {
+        $finalStatus = 'DiscoverySettingsBlocked'
+        Exit-MsiRun -Code 11 -Reason 'DiscoverySettingsDetected'
+    }
+}
+else {
+    Write-Host "No discovery/scanning settings detected."
+}
+Write-Host "===================================="
+
+# ================================================================================================
+# Phase 7 - PowerShell PATH integrity check / repair
+#
+# Runs BEFORE the download and install so the machine is healthy by the time the agent registers,
+# and so an already-installed-but-broken agent is fixed even when the version gate later decides
+# to skip the install entirely (the common case on Andrew's affected endpoints).
+#
+# Gate 1: $EnablePowerShellPathCheck  -> skip the whole phase.
+# Gate 2: $RepairPowerShellPath       -> detect and report only; make no writes.
+# ================================================================================================
+if (-not $EnablePowerShellPathCheck) {
+    $powerShellPathStatus = 'SkippedByConfig'
+    Write-Host "=== PowerShell PATH Integrity (Phase 7) ==="
+    Write-Host "[PSPath] Disabled by configuration (`$EnablePowerShellPathCheck = `$false). No detection or repair performed."
+    Write-Host "==========================================="
+}
+else {
+    $powerShellPathDiagnostics = Get-PowerShellPathDiagnostics -LengthWarningThreshold $MachinePathLengthWarningThreshold -RunExecutionProbe ([bool]$TestPowerShellExecution)
+    $powerShellPathStatus           = $powerShellPathDiagnostics.Status
+    $powerShellExecutionProbeResult = $powerShellPathDiagnostics.ExecutionProbe
+
+    $pathRepairResult      = $null
+    $serviceMitigationResult = $null
+
+    if ($powerShellPathDiagnostics.Healthy) {
+        Write-Host "[PSPath] powershell.exe resolves correctly from the machine PATH; no repair required."
+    }
+    elseif (-not $RepairPowerShellPath) {
+        # Audit mode. Report the diagnosis in full and change nothing.
+        Write-Warning "[PSPath] A PowerShell PATH problem was detected but auto-repair is disabled (`$RepairPowerShellPath = `$false). Reporting only; no changes made."
+    }
+    elseif (-not $powerShellPathDiagnostics.Repairable) {
+        # powershell.exe is not on disk. Editing PATH cannot help; say so plainly instead of
+        # writing a change that will not fix anything.
+        Write-Warning "[PSPath] The failure is NOT repairable by a PATH edit on this device. See findings above."
+    }
+    else {
+        $powerShellPathRepairAttempted = $true
+        $pathRepairResult = Invoke-PowerShellPathRepair -Diagnostics $powerShellPathDiagnostics `
+                                                        -TargetFolder $Folder `
+                                                        -RepairPath $true `
+                                                        -RepairPathExtValue ([bool]$RepairPathExt) `
+                                                        -NormalizeEntries ([bool]$NormalizeMachinePathEntries) `
+                                                        -LengthWarningThreshold $MachinePathLengthWarningThreshold
+
+        $powerShellPathEntriesAdded       = @($pathRepairResult.EntriesAdded)
+        $powerShellPathValueKindCorrected = [bool]$pathRepairResult.ValueKindCorrected
+        $pathExtRepairApplied             = [bool]$pathRepairResult.PathExtChanged
+        $powerShellPathBackupFile         = $pathRepairResult.PathBackupFile
+        $pathExtBackupFile                = $pathRepairResult.PathExtBackupFile
+
+        foreach ($e in @($pathRepairResult.Errors)) { $summaryWarnings.Add("[PSPath] $e") | Out-Null }
+
+        if ($pathRepairResult.PathChanged -or $pathRepairResult.PathExtChanged) {
+            # Update THIS process so msiexec and every other child launched below inherits the
+            # corrected values immediately, without waiting for the broadcast or a reboot.
+            $refreshedPath = Get-MachineEnvironmentValueInfo -Name 'Path'
+            if ($refreshedPath.Exists -and -not [string]::IsNullOrWhiteSpace($refreshedPath.ExpandedValue)) {
+                $powerShellPathCorrectedExpandedPath = [string]$refreshedPath.ExpandedValue
+                $env:Path = $powerShellPathCorrectedExpandedPath
+            }
+            $refreshedPathExt = Get-MachineEnvironmentValueInfo -Name 'PATHEXT'
+            if ($refreshedPathExt.Exists -and -not [string]::IsNullOrWhiteSpace($refreshedPathExt.ExpandedValue)) {
+                $env:PATHEXT = [string]$refreshedPathExt.ExpandedValue
+            }
+
+            if ($BroadcastEnvironmentChange) { [void](Send-EnvironmentChangeBroadcast) }
+
+            # Re-run detection to confirm the repair actually took.
+            $postRepair = Get-PowerShellPathDiagnostics -LengthWarningThreshold $MachinePathLengthWarningThreshold -RunExecutionProbe $false
+            $powerShellPathPostRepairStatus = $postRepair.Status
+            $powerShellPathRepairSucceeded  = [bool]$postRepair.Healthy
+
+            if ($powerShellPathRepairSucceeded) {
+                Write-Host ("[PSPath] Repair verified: powershell.exe now resolves from the machine PATH at [{0}]." -f $postRepair.ResolvedFromMachinePath)
+            }
+            else {
+                Write-Warning ("[PSPath] Repair was written but verification still reports status '{0}'. Findings: {1}" -f $postRepair.Status, (@($postRepair.Findings) -join ', '))
+            }
+
+            # Deliver the corrected PATH to the agent service without requiring a reboot. Only
+            # meaningful if the agent is already installed; the post-install hook repeats this for
+            # a fresh install once the service exists.
+            if ($powerShellPathCorrectedExpandedPath) {
+                $serviceMitigationResult = Invoke-LiongardServicePathMitigation -ExpandedPath $powerShellPathCorrectedExpandedPath `
+                                                                                -ApplyOverride ([bool]$ApplyServiceEnvironmentOverride) `
+                                                                                -RestartService ([bool]$RestartAgentServiceAfterPathRepair)
+                if ($serviceMitigationResult.ServicesFound -gt 0) {
+                    $powerShellPathServiceMitigationDone = $true
+                    $powerShellPathServiceOverrideApplied = ($serviceMitigationResult.OverridesApplied -gt 0)
+                    $powerShellPathServicesRestarted      = $serviceMitigationResult.ServicesRestarted
+                    $powerShellPathRebootRecommended      = [bool]$serviceMitigationResult.RebootStillNeeded
+                    foreach ($e in @($serviceMitigationResult.Errors)) { $summaryWarnings.Add("[PSPath] $e") | Out-Null }
+                }
+                else {
+                    Write-Host "[PSPath] No Liongard service present yet; the service environment override will be applied after the install completes."
+                }
+            }
+        }
+        else {
+            Write-Warning "[PSPath] Repair produced no change. Either the required entries were already present under a different form, or the registry write failed (see errors above)."
+        }
+    }
+
+    Write-PowerShellPathReport -Diagnostics $powerShellPathDiagnostics -Repair $pathRepairResult -ServiceMitigation $serviceMitigationResult
+
+    # Optional hard stop. Default is advisory: warn and continue, so a PATH problem never blocks an
+    # install that would otherwise succeed. Only fires when PowerShell is genuinely unresolvable
+    # AND the repair did not fix it.
+    $stillBroken = (-not $powerShellPathDiagnostics.Healthy) -and (-not $powerShellPathRepairSucceeded)
+    if ($stillBroken) {
+        if ($FailOnPowerShellPathUnrepairable) {
+            Write-Error ("[PSPath][ERROR] PowerShell cannot be resolved from PATH and the condition was not repaired (status '{0}'). FailOnPowerShellPathUnrepairable is true, so the run is aborting." -f $powerShellPathStatus)
+            $finalStatus = 'PowerShellPathUnrepairable'
+            Exit-MsiRun -Code 44 -Reason 'PowerShellPathUnrepairable'
+        }
+        else {
+            Write-Warning ("[PSPath][WARN] PowerShell PATH problem persists (status '{0}'). Continuing because FailOnPowerShellPathUnrepairable is false. The agent may install successfully but fail to run inspections with: exec: `"powershell`": executable file not found in %PATH%" -f $powerShellPathStatus)
+            $summaryWarnings.Add(("[PSPath] Unresolved PowerShell PATH condition: {0}" -f $powerShellPathStatus)) | Out-Null
+        }
+    }
+}
+
+$instancePrefix = Resolve-InstancePrefix -Value $InstancePrefix
+$liongardHost   = "$instancePrefix.app.liongard.com"
+Write-Host "Liongard instance host: $liongardHost"
+
+$localHostname = $env:COMPUTERNAME
+Write-Host "Local hostname: $localHostname"
+
+# Build API auth headers only when an optional API-backed feature is enabled; the base install
+# path makes no Liongard API calls and needs no API tokens.
+$headers = if ($apiFeatureEnabled) { Get-LiongardAuthHeader -ApiTokenKey $ApiTokenKey -ApiTokenSecret $ApiTokenSecret } else { $null }
+
+# Resolve the environment name against the Liongard API to catch casing or punctuation
+# differences before they are baked into the agent record. Optional API-backed feature: runs only
+# when $EnableEnvironmentNameMatching = $true; otherwise the supplied value passes through unchanged.
+if (-not $EnableEnvironmentNameMatching) {
+    $script:EnvironmentResolutionReason = 'MatchingDisabledByConfig'
+    Write-Host "API-backed environment name matching is disabled by configuration; the supplied environment value is passed through unchanged (no environment lookup API call)."
+}
+elseif ($IncludeEnvironmentValue -and -not [string]::IsNullOrWhiteSpace($Environment)) {
+    $script:EnvironmentResolutionReason = $null
+    $resolvedEnvironment = Resolve-LiongardEnvironmentName -InputName $Environment -InstancePrefix $instancePrefix -Headers $headers
+
+    if ($resolvedEnvironment -and -not [string]::Equals($resolvedEnvironment, $Environment, [System.StringComparison]::Ordinal)) {
+        Write-Host ("Matched provided environment to Liongard: '{0}' -> '{1}' (Reason: {2})" -f $Environment, $resolvedEnvironment, $script:EnvironmentResolutionReason)
+        $Environment = $resolvedEnvironment
+    }
+    elseif ($resolvedEnvironment) {
+        Write-Host ("Environment confirmed in Liongard: '{0}' (Reason: {1})" -f $Environment, $script:EnvironmentResolutionReason)
+    }
+    else {
+        $normalizedEnv = Normalize-EnvironmentName -Value $Environment
+        $reasonLabel   = if ($script:EnvironmentResolutionReason) { $script:EnvironmentResolutionReason } else { 'Unknown' }
+
+        if ($reasonLabel -eq 'NoEnvironmentsReturned') {
+            Write-Warning ("Environment lookup API returned no environments for host '{0}'. Continuing with the supplied LIONGARDENVIRONMENT value '{1}' without API confirmation." -f $liongardHost, $Environment)
+        }
+        else {
+            Write-Error ("Environment '{0}' (normalized '{1}') could not be resolved in Liongard. Reason: {2}. Aborting installation because LIONGARDENVIRONMENT is required." -f $Environment, $normalizedEnv, $reasonLabel)
+            $resolvedEnvironmentValue = $Environment
+            $finalStatus = 'EnvironmentResolutionFailed'
+            Exit-MsiRun -Code 11 -Reason 'EnvironmentUnresolved'
+        }
+    }
+}
+
+# Capture the (possibly API-corrected) environment value for read-only reporting.
+$resolvedEnvironmentValue = $Environment
+
+# ================================
+# Phase 6 - Environment / Device Validation Advisory (read-only, best-effort)
+# Optional API-backed feature. Runs only when $EnableEnvironmentDeviceValidation = $true. Advisory
+# by default; only a HIGH-confidence different-environment match aborts, and only when
+# $FailOnEnvironmentMismatch = $true. Strict blocking is possible ONLY when this feature is enabled.
+# Never re-registers or modifies any record.
+# ================================
+if ($EnableEnvironmentDeviceValidation) {
+    $environmentValidation = Invoke-EnvironmentDeviceValidation -InstancePrefix $instancePrefix -Headers $headers -DeviceIdentity $deviceIdentity -ExpectedEnvironment $resolvedEnvironmentValue -HighConfidenceThreshold $EnvironmentValidationHighConfidenceThreshold
+}
+else {
+    $environmentValidation = [pscustomobject]@{
+        Status                 = 'SkippedByConfig'
+        ApiAvailable           = $false
+        ConfidenceScore        = 0
+        ConfidenceLevel        = 'None'
+        MatchedAgentId         = $null
+        MatchedAgentName       = $null
+        MatchedEnvironment     = $null
+        ExpectedEnvironment    = $resolvedEnvironmentValue
+        MatchSignals           = @()
+        Mismatch               = $false
+        HighConfidenceMismatch = $false
+        Warnings               = @()
+    }
+}
+$environmentValidationStatus = $environmentValidation.Status
+
+Write-Host "=== Environment / Device Validation Advisory ==="
+Write-Host ("EnableEnvironmentDeviceValidation : {0}" -f $EnableEnvironmentDeviceValidation)
+if (-not $EnableEnvironmentDeviceValidation) {
+    Write-Host "API-backed environment/device validation is disabled by configuration; the advisory validation was skipped (no agent validation API call)."
+}
+Write-Host ("Status                 : {0}" -f $environmentValidation.Status)
+Write-Host ("API available          : {0}" -f $environmentValidation.ApiAvailable)
+Write-Host ("Expected environment   : {0}" -f $environmentValidation.ExpectedEnvironment)
+Write-Host ("Matched agent          : {0}" -f $(if ($environmentValidation.MatchedAgentId) { "$($environmentValidation.MatchedAgentId) ($($environmentValidation.MatchedAgentName))" } else { 'none' }))
+Write-Host ("Matched environment    : {0}" -f $(if ($environmentValidation.MatchedEnvironment) { $environmentValidation.MatchedEnvironment } else { 'unknown' }))
+Write-Host ("Confidence score/level : {0} / {1}" -f $environmentValidation.ConfidenceScore, $environmentValidation.ConfidenceLevel)
+Write-Host ("Match signals          : {0}" -f $(if (@($environmentValidation.MatchSignals).Count -gt 0) { @($environmentValidation.MatchSignals) -join ', ' } else { 'None' }))
+Write-Host ("Mismatch detected      : {0}" -f $environmentValidation.Mismatch)
+Write-Host ("Strict mode            : {0}" -f $FailOnEnvironmentMismatch)
+foreach ($vw in @($environmentValidation.Warnings)) { Write-Warning ([string]$vw) }
+
+if ($environmentValidation.Mismatch) {
+    if ($FailOnEnvironmentMismatch -and $environmentValidation.HighConfidenceMismatch) {
+        $environmentValidationStrictModeBlocked = $true
+        Write-Host ("Strict mode blocked run: {0}" -f $true)
+        Write-Error "[EnvironmentValidation][ERROR] High-confidence environment mismatch detected. FailOnEnvironmentMismatch is true, so install/update will not proceed."
+        $finalStatus = 'EnvironmentMismatchBlocked'
+        Exit-MsiRun -Code 11 -Reason 'EnvironmentMismatchBlocked'
+    }
+    else {
+        Write-Host ("Strict mode blocked run: {0}" -f $false)
+        Write-Warning "[EnvironmentValidation][WARN] This device appears to already exist in Liongard under a different environment. Continuing because FailOnEnvironmentMismatch is false (or the match is not high-confidence)."
+    }
+}
+else {
+    Write-Host ("Strict mode blocked run: {0}" -f $false)
+}
+Write-Host "================================================"
+
+# Prepare the download directory.
+Write-Host "Checking if folder [$Folder] exists..."
+if (-not (Test-Path -Path $Folder)) {
+    Write-Host "Creating directory at [$Folder]..."
+    New-Item -Path $Folder -ItemType Directory -Force | Out-Null
+}
+
+if (-not (Test-Path -Path $Folder)) {
+    Write-Error "Failed to create directory [$Folder]. Check permissions and rerun the script."
+    $finalStatus = 'FolderCreationFailed'
+    Exit-MsiRun -Code 20 -Reason 'FolderUnavailable'
+}
+
+$installerPath = Join-Path -Path $Folder -ChildPath 'LiongardAgent-lts.msi'
+if (-not (Get-LiongardInstaller -Uri $InstallerUrl -DestinationPath $installerPath)) {
+    Write-Error "Failed to download installer from [$InstallerUrl] after multiple attempts. Aborting."
+    $finalStatus = 'DownloadFailed'
+    Exit-MsiRun -Code 20 -Reason 'InstallerDownloadFailed'
+}
+
+# Version gate: compare the downloaded MSI against any currently installed agent.
+# Proceed only when no agent is present, or the MSI is strictly newer.
+# Installed-agent version + presence come from the ProductCode-agnostic detection helper -- the
+# legacy single-product-code DisplayVersion read is no longer the sole source. See
+# Get-LiongardAgentInstallInfo.
+$installInfo = Get-LiongardAgentInstallInfo
+$installedVersion = $installInfo.Version
+$agentAlreadyInstalled = ([bool]$installInfo.Installed -or ($detectionSnapshot -and $detectionSnapshot.State -ne 'NotDetected') -or [bool]$installedVersion)
+$msiVersion = $null
+if ($agentAlreadyInstalled) {
+    $msiVersion = Get-MsiProductVersion -Path $installerPath
+}
+$installerVersionUnknown = ($agentAlreadyInstalled -and -not $msiVersion)
+$installedVersionUnknown = ($agentAlreadyInstalled -and -not $installedVersion)
+foreach ($w in @($installInfo.Warnings)) { $summaryWarnings.Add([string]$w) | Out-Null; Write-Warning ([string]$w) }
+Write-Host "=== Installed Agent Detection ==="
+Write-Host ("Installed Agent Detected   : {0}" -f $installInfo.Installed)
+Write-Host ("Detection Method           : {0}" -f $installInfo.DetectionMethod)
+Write-Host ("Installed Version          : {0}" -f $(if ($installedVersion) { $installedVersion.ToString() } else { '<unknown / none>' }))
+Write-Host ("Installed Version Source   : {0}" -f $installInfo.VersionSource)
+Write-Host ("Installed Product Code     : {0}" -f $(if ($installInfo.ProductCode) { $installInfo.ProductCode } else { '<n/a>' }))
+Write-Host ("Installed Uninstall Key    : {0}" -f $(if ($installInfo.UninstallKeyPath) { $installInfo.UninstallKeyPath } else { '<n/a>' }))
+Write-Host "================================="
+
+if ($installedVersion -and $msiVersion -and $msiVersion -le $installedVersion) {
+    Write-Host ("Liongard Agent {0} is already installed and the downloaded MSI ({1}) is not a newer version. Skipping installation." -f $installedVersion, $msiVersion)
+    $decidedAction = 'SkipUpToDate'
+    $finalStatus = 'SkippedUpToDate'
+    $updateParameterPolicyNotApplicableReason = 'AlreadyCurrentSkip'
+    Exit-MsiRun -Code 0 -Reason 'AlreadyCurrent'
+}
+elseif ($agentAlreadyInstalled -and $installerVersionUnknown) {
+    # Phase 4: installer (MSI) version unreadable AND an agent is already present. Skip to
+    # avoid a blind reinstall/update over an existing (possibly newer) agent.
+    Write-Warning "Unable to read ProductVersion from the downloaded MSI and an agent is already installed; skipping the install/update to avoid overwriting an existing agent."
+    $decidedAction = 'SkipInstallerVersionUnknown'
+    $finalStatus = 'SkippedUpToDate'
+    $updateParameterPolicyNotApplicableReason = 'InstallerVersionUnknownSkip'
+    Exit-MsiRun -Code 0 -Reason 'InstallerVersionUnknownSkip'
+}
+elseif ($installedVersion) {
+    Write-Host ("Newer version detected. Proceeding with an in-place update: {0} -> {1}." -f $installedVersion, $msiVersion)
+}
+elseif ($agentAlreadyInstalled) {
+    Write-Host "Agent detected but its installed version could not be determined; proceeding with an in-place update (upgrade-safe properties)."
+}
+
+# Read-only label of the action the existing logic will take (no decision changed here).
+$decidedAction = if ($agentAlreadyInstalled) { 'Upgrade' } else { 'Install' }
+Write-Host ("Pre-action decision (existing logic): {0}" -f $decidedAction)
+
+Write-Host "Installing the Liongard Agent..."
+
+$logPath = Join-Path -Path $Folder -ChildPath 'AgentInstall.log'
+if (Test-Path -LiteralPath $logPath) {
+    Write-Host "Removing existing installer log [$logPath] to capture fresh results..."
+    Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
+}
+
+# ================================
+# Phase 4 - Update Parameter Policy
+# Fresh install -> full properties. In-place update -> upgrade-safe properties by default
+# (registration/config withheld), unless $ReassertInstallParametersOnUpdate re-asserts them.
+# ================================
+if ($agentAlreadyInstalled) {
+    if ($ReassertInstallParametersOnUpdate) {
+        $installParameterMode = 'FullPropertiesReassertedOnUpdate'
+    }
+    else {
+        $installParameterMode = 'UpgradeSafeProperties'
+    }
+}
+else {
+    $installParameterMode = 'FullInstallProperties'
+}
+$useUpgradeSafe = ($installParameterMode -eq 'UpgradeSafeProperties')
+$registrationParamsReasserted = ($installParameterMode -eq 'FullPropertiesReassertedOnUpdate')
+$withheldRegistrationParameters = if ($useUpgradeSafe) {
+    @('LIONGARDURL','LIONGARDACCESSKEY','LIONGARDACCESSSECRET','LIONGARDAGENTNAME','LIONGARDENVIRONMENT','LIONGARDDESCRIPTION')
+}
+else { @() }
+
+Write-Host "=== Update Parameter Policy ==="
+Write-Host ("ReassertInstallParametersOnUpdate : {0}" -f $ReassertInstallParametersOnUpdate)
+Write-Host ("Decision                          : {0}" -f $installParameterMode)
+Write-Host ("Service Health (read-only)        : {0}" -f $(if ($detectionSnapshot) { $detectionSnapshot.State } else { '<unknown>' }))
+Write-Host ("Withheld registration properties  : {0}" -f $(if ($withheldRegistrationParameters.Count -gt 0) { $withheldRegistrationParameters -join ', ' } else { '<none>' }))
+if ($registrationParamsReasserted) {
+    Write-Warning "[UpdatePolicy][WARN] Registration/configuration parameters are being reasserted during update. This may overwrite existing local Liongard Agent configuration."
+}
+Write-Host "==============================="
+
+$msiArguments = @("/i", "`"$installerPath`"")
+
+if (-not $useUpgradeSafe) {
+    # Registration/configuration properties: passed only on a fresh install (or when re-asserted).
+    $msiArguments += @(
+        "LIONGARDURL=$liongardHost",
+        "LIONGARDACCESSKEY=$AgentTokenKey",
+        "LIONGARDACCESSSECRET=$AgentTokenSecret",
+        "LIONGARDAGENTNAME=`"$localHostname`""
+    )
+
+    if ($IncludeEnvironmentValue -and -not [string]::IsNullOrWhiteSpace($Environment)) {
+        $msiArguments += "LIONGARDENVIRONMENT=`"$Environment`""
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($AgentDescription)) {
+        $msiArguments += "LIONGARDDESCRIPTION=`"$AgentDescription`""
+    }
+}
+
+$msiArguments += @("/qn", "/norestart", "/L*V", "`"$logPath`"")
+
+# Phase 3: safety net — the MSI argument list is built from a fixed, discovery-free template.
+# Re-scan it before launching msiexec in case a discovery property was hand-edited in. The MSI
+# path must never pass enhanced-network-discovery / Npcap properties.
+$discoveryArgMatches = @($msiArguments | Where-Object { $_ -match '(?i)(InstallEnhancedNetworkDiscovery|InstallNpcap|EnableNetworkDiscovery|network_discovery)' })
+if ($discoveryArgMatches.Count -gt 0) {
+    $discoverySettingsDetected = $true
+    foreach ($m in $discoveryArgMatches) { $discoveryIndicators.Add("argument:$m") | Out-Null }
+    Write-Warning ("Discovery/scanning properties found in the MSI argument list: {0}. The MSI path must not install discovery dependencies." -f ($discoveryArgMatches -join ', '))
+    if ($BlockDiscoverySettings) {
+        $finalStatus = 'DiscoverySettingsBlocked'
+        Exit-MsiRun -Code 11 -Reason 'DiscoverySettingsDetected'
+    }
+}
+
+$process  = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArguments -Wait -PassThru
+$exitCode = if ($process) { $process.ExitCode } else { $LASTEXITCODE }
+Write-Host "Installation command completed. Evaluating results..."
+
+$summary = Read-MsiLogSummary -Path $logPath -MaxWaitSeconds 60
+if ($summary.Found) {
+    $resultText = Get-MsiResultText -Code $summary.Code
+    if ($summary.InvalidMsg) {
+        Write-Host ("MSI status: {0} ({1})`nReason: {2}" -f $summary.Code, $resultText, $summary.InvalidMsg)
+    }
+    else {
+        Write-Host ("MSI status: {0} ({1})`nLog line: {2}" -f $summary.Code, $resultText, $summary.Line)
+    }
+}
+else {
+    if (Test-Path -LiteralPath $logPath) {
+        Write-Host "MSI log available at [$logPath], but no summary pattern was found."
+    }
+    else {
+        Write-Warning "MSI log file [$logPath] was not found."
+    }
+}
+
+$msiExitCode = if ($summary.Found) { $summary.Code } else { $exitCode }
+
+Start-Sleep -Seconds 2
+$agentDetected = $false
+for ($attempt = 0; $attempt -lt 3; $attempt++) {
+    if (Test-LiongardAgentInstalled) {
+        $agentDetected = $true
+        break
+    }
+    Start-Sleep -Seconds 2
+}
+
+if (-not $summary.Found -and $agentDetected -and $exitCode -eq 0) {
+    $msiExitCode = 0
+}
+
+if (($msiExitCode -eq 0 -or $msiExitCode -eq 3010) -and $agentDetected) {
+    Write-Host "Liongard Agent installation verified successfully (process=$exitCode, msi=$msiExitCode)."
+    $finalStatus = if ($msiExitCode -eq 3010) { 'SuccessReboot' } else { 'Success' }
+
+    # ------------------------------------------------------------------------------------------
+    # Phase 7 post-install hook. On a FRESH install the agent service did not exist when the PATH
+    # repair ran, so the per-service Environment override could not be written then. Apply it now
+    # and restart the service, so the newly registered agent starts with a correct PATH instead of
+    # inheriting the stale boot-time SCM environment block.
+    # ------------------------------------------------------------------------------------------
+    if ($EnablePowerShellPathCheck -and $powerShellPathRepairAttempted -and -not $powerShellPathServiceMitigationDone) {
+        if ($powerShellPathCorrectedExpandedPath) {
+            Write-Host "[PSPath] Applying the corrected PATH to the newly installed agent service..."
+            $postInstallMitigation = Invoke-LiongardServicePathMitigation -ExpandedPath $powerShellPathCorrectedExpandedPath `
+                                                                          -ApplyOverride ([bool]$ApplyServiceEnvironmentOverride) `
+                                                                          -RestartService ([bool]$RestartAgentServiceAfterPathRepair)
+            if ($postInstallMitigation.ServicesFound -gt 0) {
+                $powerShellPathServiceMitigationDone  = $true
+                $powerShellPathServiceOverrideApplied = ($postInstallMitigation.OverridesApplied -gt 0)
+                $powerShellPathServicesRestarted      = $postInstallMitigation.ServicesRestarted
+                $powerShellPathRebootRecommended      = [bool]$postInstallMitigation.RebootStillNeeded
+                foreach ($e in @($postInstallMitigation.Errors)) { $summaryWarnings.Add("[PSPath] $e") | Out-Null }
+            }
+            else {
+                Write-Warning "[PSPath] No Liongard service was found after a reportedly successful install; the service environment override could not be applied."
+                $powerShellPathRebootRecommended = $true
+            }
+            Write-PowerShellPathReport -Diagnostics $powerShellPathDiagnostics -Repair $null -ServiceMitigation $postInstallMitigation
+        }
+        else {
+            Write-Warning "[PSPath] A repair was attempted but no corrected PATH value was captured; skipping the service environment override."
+        }
+    }
+
+    Start-Sleep -Seconds 3
+    Write-Host "Exiting script..."
+    $successCode = if ($msiExitCode -eq 3010) { 2 } else { 0 }
+    Exit-MsiRun -Code $successCode -Reason 'InstallVerified'
+}
+
+Write-Warning "Liongard Agent installation failed or agent not detected. Exit code: $exitCode | MSI status: $msiExitCode"
+if ($summary.InvalidMsg) {
+    Write-Warning "MSI reported: $($summary.InvalidMsg)"
+}
+if (-not $agentDetected) {
+    Write-Warning "Test-LiongardAgentInstalled returned false after the install attempt."
+}
+Start-Sleep -Seconds 5
+
+# Phase 2: classify the failure for a standardized exit code. The raw MSI code is preserved
+# in the warning above and in the JSON summary. Behavior of the install itself is unchanged.
+#   - Installer reported success (0/3010) but agent not detected -> partial validation (43).
+#   - Installer returned an error -> update failure (41) if an agent was already installed
+#     (the existing upgrade branch), otherwise fresh-install failure (40).
+if ($msiExitCode -eq 0 -or $msiExitCode -eq 3010) {
+    $finalStatus = 'PartialValidation'
+    $failCode = 43
+}
+elseif ($agentAlreadyInstalled) {
+    $finalStatus = 'Failed'
+    $failCode = 41
+}
+else {
+    $finalStatus = 'Failed'
+    $failCode = 40
+}
+Exit-MsiRun -Code $failCode -Reason 'InstallFailedOrNotDetected'
