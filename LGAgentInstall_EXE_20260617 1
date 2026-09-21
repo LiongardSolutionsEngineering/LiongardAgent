@@ -63,8 +63,8 @@ $ApiTokenSecret          = "REPLACE_WITH_API_TOKEN_SECRET"    # Liongard API tok
 # bundle's enhanced-network-discovery flag (Npcap + Visual C++) is always passed, and
 # network_discovery.yml is set to enabled after install/update/skip. These two values remain $true
 # and exist only as a Support override; partners never change them, and there is no per-host opt-in.
-$EnableNetworkDiscovery  = $true     # Always enable network discovery after install (EXE discovery path)
-$InstallNpcap            = $true     # Always install Npcap + bundle Visual C++ (EXE discovery path)
+$EnableNetworkDiscovery  = $false     # Always enable network discovery after install (EXE discovery path)
+$InstallNpcap            = $false     # Always install Npcap + bundle Visual C++ (EXE discovery path)
 
 # Installer source / locations.
 $Folder                  = "C:\Liongard"
